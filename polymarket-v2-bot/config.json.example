@@ -1,0 +1,27 @@
+{
+  "polymarket": {
+    "gamma_api_url": "https://gamma-api.polymarket.com",
+    "clob_api_url": "https://clob.polymarket.com",
+    "api_key": "your-api-key",
+    "api_secret": "your-api-secret",
+    "api_passphrase": "your-api-passphrase",
+    "private_key": "your-private-key",
+    "proxy_wallet_address": "0x...",
+    "signature_type": 2,
+    "use_relayer": false,
+    "relayer_api_key": "your-relayer-api-key",
+    "relayer_api_key_address": "0x..."
+  },
+  "strategy": {
+    "shares": 5,
+    "buy_price": 0.01,
+    "sell_price": 0.02,
+    "check_interval_ms": 100,
+    "simulation_mode": false,
+    "market_closure_check_interval_seconds": 60
+  },
+  "rpc": {
+    "provider": "alchemy",
+    "api_key": "_xOYHVxVV4zUrBsjWe3rK"
+  }
+}

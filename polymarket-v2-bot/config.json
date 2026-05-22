@@ -1,0 +1,25 @@
+{
+  "polymarket": {
+    "gamma_api_url": "https://gamma-api.polymarket.com",
+    "clob_api_url": "https://clob.polymarket.com",
+    "api_key": "019e25b4-bd29-7a6c-9541-77574e0244ed",
+    "api_secret": "GS6LWREPfwEufbNnrA-IEFl8zHB5JXePXNCABnDq_3E=",
+    "api_passphrase": "a7172048e9118ee9469bfad3af93acab9bf2e3388b93fbbe23311649fa80d3a2",
+    "private_key": "014657baafc70c2b2d140fce2342531d5fb72080b154dc819a27f7417be1a920",
+    "proxy_wallet_address": "0x69386B7826b4b01b4aD716F6d3703Bcc01CF0028",
+    "signature_type": 2,
+    "use_relayer": true,
+    "relayer_api_key": "019d1f96-4dac-7e44-99a7-9a1495fb52d8",
+    "relayer_api_key_address": "0x3da98b9076416103bcBf73489f2dDA8f1f601726"
+  },
+  "strategy": {
+    "shares": 5,
+    "buy_price": 0.01,
+    "sell_price": 0.02,
+    "check_interval_ms": 100,
+    "simulation_mode": false,
+    "market_closure_check_interval_seconds": 60
+  },
+  "rpc": "https://polygon.drpc.org",
+  "rpc_backup": "https://rpc.ankr.com/polygon"
+}
