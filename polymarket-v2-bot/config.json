@@ -2,15 +2,15 @@
   "polymarket": {
     "gamma_api_url": "https://gamma-api.polymarket.com",
     "clob_api_url": "https://clob.polymarket.com",
-    "api_key": "019e25b4-bd29-7a6c-9541-77574e0244ed",
-    "api_secret": "GS6LWREPfwEufbNnrA-IEFl8zHB5JXePXNCABnDq_3E=",
-    "api_passphrase": "a7172048e9118ee9469bfad3af93acab9bf2e3388b93fbbe23311649fa80d3a2",
-    "private_key": "014657baafc70c2b2d140fce2342531d5fb72080b154dc819a27f7417be1a920",
-    "proxy_wallet_address": "0x69386B7826b4b01b4aD716F6d3703Bcc01CF0028",
+    "api_key": "019e4f5f-a080-70df-a93f-34768e702159",
+    "api_secret": "9coE23bNJ-cy-NeLjWmShVFdrK2h40rzj3mr4rAvx8k=",
+    "api_passphrase": "e4128840813a01a62f72f0b383a6009239f2e486afdb63677276808b6bc290d0",
+    "private_key": "43a287ab5cd46ab7aca8c157e5c6d5b5db1d0ecc6e37c7b82db090284e360cfb",
+    "proxy_wallet_address": "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48",
     "signature_type": 2,
     "use_relayer": true,
-    "relayer_api_key": "019d1f96-4dac-7e44-99a7-9a1495fb52d8",
-    "relayer_api_key_address": "0x3da98b9076416103bcBf73489f2dDA8f1f601726"
+    "relayer_api_key": "019e4540-b8aa-7404-b3be-a9f900e461bb",
+    "relayer_api_key_address": "0x2200709f4eeee905a9f463afc92e215630bc6b62"
   },
   "strategy": {
     "shares": 5,
