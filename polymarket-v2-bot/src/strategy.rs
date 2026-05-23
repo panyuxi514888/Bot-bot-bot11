@@ -196,8 +196,8 @@ impl PreLimitStrategy {
         // P1: Check pending merges on startup (after restart)
         self.check_pending_merges_on_startup().await;
 
+        // Main strategy loop with shutdown support
         loop {
-            // Check for shutdown signal
             if shutdown_token.is_cancelled() {
                 info!("Shutdown signal received, stopping strategy loop");
                 break;
@@ -207,7 +207,6 @@ impl PreLimitStrategy {
                 error!("Error processing market: {}", e);
             }
 
-            // Sleep with shutdown support
             tokio::select! {
                 _ = sleep(Duration::from_millis(self.config.strategy.check_interval_ms)) => {}
                 _ = shutdown_token.cancelled() => {
@@ -374,49 +373,79 @@ impl PreLimitStrategy {
                             .get_market_tokens(&market.condition_id)
                             .await?;
 
-                        // const SPLIT_AMOUNT: f64 = 5.0;
+                        // Replace CTF split: market-buy next period's UP+DOWN tokens FIRST
+                        let next_period = current_period_et + MARKET_DURATION_SECS;
+                        match self.discover_market("BTC", next_period).await {
+                            Ok(Some(next_market)) => {
+                                let (next_up, next_down) = self
+                                    .discovery
+                                    .get_market_tokens(&next_market.condition_id)
+                                    .await?;
+                                info!(
+                                    "Pre-buying next period tokens ({}) at market price",
+                                    &next_market.condition_id[..16]
+                                );
+                                if let Err(e) = self.place_market_order(&next_up, "BUY").await {
+                                    warn!("Next period UP market buy failed: {}", e);
+                                }
+                                if let Err(e) = self.place_market_order(&next_down, "BUY").await {
+                                    warn!("Next period DOWN market buy failed: {}", e);
+                                }
+                            }
+                            Ok(None) => {
+                                info!("Next period market not yet available, skipping pre-buy");
+                            }
+                            Err(e) => {
+                                warn!("Failed to discover next period market: {}", e);
+                            }
+                        }
 
-                        // Check for duplicate orders before placing - verify no existing orders for this market
+                        // Check for existing orders — if found, restore state from them
                         if !self.config.strategy.simulation_mode {
                             if let Ok(orders) = self.api.get_open_orders(&market.condition_id).await {
-                                let existing_orders: Vec<_> = orders.iter().filter(|o| {
+                                let existing: Vec<_> = orders.iter().filter(|o| {
                                     o.token_id == up_token_id || o.token_id == down_token_id
                                 }).collect();
-                                if !existing_orders.is_empty() {
-                                    warn!("Found {} existing orders for this market, skipping duplicate order placement", existing_orders.len());
+                                if !existing.is_empty() {
+                                    info!(
+                                        "Found {} existing orders, restoring state (skipping new placement)",
+                                        existing.len()
+                                    );
+                                    let restored = PreLimitOrderState {
+                                        asset: "BTC".to_string(),
+                                        condition_id: market.condition_id,
+                                        up_token_id: up_token_id.clone(),
+                                        down_token_id: down_token_id.clone(),
+                                        up_order_id: None,
+                                        down_order_id: None,
+                                        up_buy_price: buy_price,
+                                        down_buy_price: buy_price,
+                                        up_matched: false,
+                                        down_matched: false,
+                                        up_mined: false,
+                                        down_mined: false,
+                                        up_shares_received: 0.0,
+                                        down_shares_received: 0.0,
+                                        up_spent_usdc: 0.0,
+                                        down_spent_usdc: 0.0,
+                                        up_sell_order_id: None,
+                                        down_sell_order_id: None,
+                                        expiry: next_period_start,
+                                        order_placed_at: current_time_et,
+                                        market_period_start: current_period_et,
+                                        trade_info: std::collections::HashMap::new(),
+                                        up_trade_confirmed: false,
+                                        down_trade_confirmed: false,
+                                        pending_trades: std::collections::VecDeque::new(),
+                                        split_tx_hash: None,
+                                    };
+                                    *state_guard = Some(restored);
                                     return Ok(());
                                 }
                             }
                         }
 
-                        // TODO: Split logic temporarily disabled
-                        // const SPLIT_MAX_RETRIES: u32 = 3;
-                        // const SPLIT_INITIAL_DELAY_MS: u64 = 1000;
                         let split_tx_hash: Option<String> = None;
-                        // if !self.config.strategy.simulation_mode {
-                        //     match self
-                        //         .api
-                        //         .split_shares_with_retry(
-                        //             &market.condition_id,
-                        //             SPLIT_AMOUNT,
-                        //             SPLIT_MAX_RETRIES,
-                        //             SPLIT_INITIAL_DELAY_MS,
-                        //         )
-                        //         .await
-                        //     {
-                        //         Ok(tx_hash) => {
-                        //             info!("Successfully split ${:.2} USDC into conditional shares (tx: {})", SPLIT_AMOUNT, tx_hash);
-                        //             split_tx_hash = Some(tx_hash);
-                        //         }
-                        //         Err(e) => {
-                        //             error!("CRITICAL: Split failed after {} retries: {}. Stopping order placement for this period.", SPLIT_MAX_RETRIES, e);
-                        //             return Ok(());
-                        //         }
-                        //     }
-                        // } else {
-                        //     info!("SIMULATION: Would split ${:.2} USDC into conditional shares for condition {}", SPLIT_AMOUNT, &market.condition_id[..market.condition_id.len().min(20)]);
-                        //     split_tx_hash = Some("SIM-SPLIT".to_string());
-                        // }
 
                         let up_order = self
                             .place_limit_order(&up_token_id, "BUY", buy_price)
@@ -902,6 +931,40 @@ impl PreLimitStrategy {
             };
             self.api.place_order(&order).await
         }
+    }
+
+    /// Place a marketable BUY order that fills immediately by crossing the spread.
+    /// Uses price=0.99 to ensure it matches the best available ask (~$0.50 for new markets).
+    async fn place_market_order(
+        &self,
+        token_id: &str,
+        side: &str,
+    ) -> Result<OrderResponse> {
+        let shares = self.config.strategy.shares;
+
+        if self.config.strategy.simulation_mode {
+            info!(
+                "SIMULATION: Would place {} market order for token {}: {} shares",
+                side, token_id, shares
+            );
+            let fake_order_id = format!("SIM-MARKET-{}-{}", side, chrono::Utc::now().timestamp());
+            return Ok(OrderResponse {
+                order_id: Some(fake_order_id),
+                status: "SIMULATED".to_string(),
+                message: Some("Market order simulated".to_string()),
+            });
+        }
+
+        let order = OrderRequest {
+            token_id: token_id.to_string(),
+            side: side.to_string(),
+            size: shares.to_string(),
+            price: "0.99".to_string(),
+            order_type: "MARKET".to_string(),
+            time_in_force: None,
+            expire_after: None,
+        };
+        self.api.place_order(&order).await
     }
 
     async fn check_buy_order_matches(&self, state: &mut PreLimitOrderState) -> Result<()> {

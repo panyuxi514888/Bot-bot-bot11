@@ -29,8 +29,6 @@ pub struct Config {
     pub strategy: StrategyConfig,
     #[serde(default)]
     pub rpc: Option<String>,
-    #[serde(default)]
-    pub rpc_backup: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,9 +53,6 @@ impl Default for Config {
             polymarket: PolymarketConfig {
                 gamma_api_url: "https://gamma-api.polymarket.com".to_string(),
                 clob_api_url: "https://clob.polymarket.com".to_string(),
-                api_key: None,
-                api_secret: None,
-                api_passphrase: None,
                 private_key: None,
                 proxy_wallet_address: None,
                 signature_type: None,
@@ -74,7 +69,6 @@ impl Default for Config {
                 market_closure_check_interval_seconds: 120,
             },
             rpc: None,
-            rpc_backup: None,
         }
     }
 }
@@ -83,9 +77,6 @@ impl Default for Config {
 pub struct PolymarketConfig {
     pub gamma_api_url: String,
     pub clob_api_url: String,
-    pub api_key: Option<String>,
-    pub api_secret: Option<String>,
-    pub api_passphrase: Option<String>,
     pub private_key: Option<String>,
     pub proxy_wallet_address: Option<String>,
     pub signature_type: Option<u8>,

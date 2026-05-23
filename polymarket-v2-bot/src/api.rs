@@ -6,13 +6,13 @@ use serde_json::Value;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::hex::ToHexExt;
-use alloy::sol_types::SolStruct;
+use alloy::sol_types::{SolStruct, SolValue};
 use alloy_sol_types::{sol, SolCall};
 use reqwest::header::HeaderMap;
 use uuid::Uuid;
@@ -68,6 +68,21 @@ sol! {
         string  timestamp;
         uint256 nonce;
         string  message;
+    }
+
+    /// SafeTx — the EIP-712 typed struct that Safe wallets use for relayer signing.
+    #[allow(missing_docs)]
+    struct SafeTx {
+        address to;
+        uint256 value;
+        bytes data;
+        uint8 operation;
+        uint256 safeTxGas;
+        uint256 baseGas;
+        uint256 gasPrice;
+        address gasToken;
+        address refundReceiver;
+        uint256 nonce;
     }
 }
 
@@ -142,14 +157,10 @@ pub struct PolymarketApi {
     client: ReqwestClient,
     gamma_url: String,
     clob_url: String,
-    api_key: Option<String>,
-    api_secret: Option<String>,
-    api_passphrase: Option<String>,
     private_key: Option<String>,
-    proxy_wallet_address: Option<String>,
+    safe_addr_address: Option<String>,
     signature_type: Option<u8>,
     rpc_url: Option<String>,
-    rpc_backup_url: Option<String>,
     use_relayer: bool,
     relayer_api_key: Option<String>,
     relayer_api_key_address: Option<String>,
@@ -162,14 +173,10 @@ impl PolymarketApi {
     pub fn new(
         gamma_url: String,
         clob_url: String,
-        api_key: Option<String>,
-        api_secret: Option<String>,
-        api_passphrase: Option<String>,
         private_key: Option<String>,
-        proxy_wallet_address: Option<String>,
+        safe_addr_address: Option<String>,
         signature_type: Option<u8>,
         rpc_url: Option<String>,
-        rpc_backup_url: Option<String>,
         use_relayer: bool,
         relayer_api_key: Option<String>,
         relayer_api_key_address: Option<String>,
@@ -183,14 +190,10 @@ impl PolymarketApi {
             client: http_client,
             gamma_url,
             clob_url,
-            api_key,
-            api_secret,
-            api_passphrase,
             private_key,
-            proxy_wallet_address,
+            safe_addr_address,
             signature_type,
             rpc_url,
-            rpc_backup_url,
             use_relayer,
             relayer_api_key,
             relayer_api_key_address,
@@ -241,7 +244,7 @@ impl PolymarketApi {
         let address = signer.address();
 
         // Parse funder (proxy wallet) and signature type
-        let funder = match &self.proxy_wallet_address {
+        let funder = match &self.safe_addr_address {
             Some(proxy_addr) => Some(
                 Address::from_str(proxy_addr).context("Invalid proxy wallet address")?,
             ),
@@ -280,7 +283,7 @@ impl PolymarketApi {
 
         eprintln!("   ✓ Successfully authenticated with Polymarket CLOB V2 API");
         eprintln!("   ✓ Signer address: {:?}", address);
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
+        if let Some(proxy_addr) = &self.safe_addr_address {
             eprintln!("   ✓ Proxy wallet: {}", proxy_addr);
         }
         Ok(())
@@ -816,67 +819,194 @@ impl PolymarketApi {
     }
 
     async fn execute_relayer_tx(&self, calldata: Vec<u8>, label: &str) -> Result<String> {
-        use polyoxide_relay::{
-            BuilderAccount, RelayClient, SafeTransaction, WalletType,
-        };
-
         let private_key = self.private_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Private key required for Relayer {}", label))?;
         let relayer_key = self.relayer_api_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("relayer_api_key required"))?;
         let relayer_key_addr = self.relayer_api_key_address.as_ref()
             .ok_or_else(|| anyhow::anyhow!("relayer_api_key_address required"))?;
+        let signer = PrivateKeySigner::from_str(private_key)
+            .context("Invalid private key")?;
+        let eoa = signer.address();
 
-        let ctf_addr: Address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".parse()?;
+        // Derive Safe address from EOA (same as deploy_safe.rs / test_split.rs)
+        const FACTORY_ADDR: &str = "0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b";
+        const SAFE_INIT_CODE_HASH: &str =
+            "2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf";
+        let factory: Address = Address::from_str(FACTORY_ADDR)?;
+        let salt = keccak256((eoa,).abi_encode());
+        let code_hash = B256::from_str(SAFE_INIT_CODE_HASH)?;
+        let safe_addr = factory.create2(salt, code_hash);
 
-        let account = BuilderAccount::with_relayer_api_key(
-            private_key.to_string(),
-            relayer_key.to_string(),
-            relayer_key_addr.to_string(),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create BuilderAccount: {}", e))?;
+        let ctf_exchange: Address = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045".parse()?;
 
-        // Default relayer URL: https://relayer-v2.polymarket.com
-        let relay = RelayClient::builder()
-            .map_err(|e| anyhow::anyhow!("Failed to create RelayClient builder: {}", e))?
-            .with_account(account)
-            .wallet_type(WalletType::Safe)
-            .chain_id(137)
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build RelayClient: {}", e))?;
+        let client = reqwest::Client::new();
+        let base_url = "https://relayer-v2.polymarket.com";
 
-        let tx = SafeTransaction {
-            to: ctf_addr,
+        // Build relayer auth headers manually (polyoxide-relay's HeaderMap uses http 1.x
+        // which is incompatible with reqwest 0.11's http 0.2.x HeaderMap).
+        fn auth_headers(k: &str, a: &str) -> reqwest::header::HeaderMap {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::HeaderName::from_static("relayer_api_key"),
+                reqwest::header::HeaderValue::from_str(k).expect("RELAYER_API_KEY"),
+            );
+            h.insert(
+                reqwest::header::HeaderName::from_static("relayer_api_key_address"),
+                reqwest::header::HeaderValue::from_str(a).expect("RELAYER_API_KEY_ADDRESS"),
+            );
+            h
+        }
+
+        let content_type = reqwest::header::HeaderValue::from_static("application/json");
+
+        // 1 — Fetch nonce from the Safe contract on-chain
+        let rpc_url = self.get_rpc_url();
+        let nonce_data = "0xaffed0e0"; // keccak256("nonce()") first 4 bytes
+        let nonce_params = serde_json::json!([{"to": format!("{:#x}", safe_addr), "data": nonce_data}, "latest"]);
+        let nonce_body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": nonce_params});
+
+        let nonce_resp: serde_json::Value = client
+            .post(&rpc_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&nonce_body)
+            .send()
+            .await
+            .context("Failed to query on-chain nonce")?
+            .json()
+            .await
+            .context("Failed to parse nonce response")?;
+
+        let nonce_hex = nonce_resp["result"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("eth_call nonce failed: {:?}", nonce_resp))?;
+        let nonce_bytes = alloy::hex::decode(nonce_hex.strip_prefix("0x").unwrap_or(nonce_hex))
+            .context("Failed to decode nonce hex")?;
+        let nonce = U256::from_be_slice(&nonce_bytes).to::<u64>();
+
+        log::info!("[RELAYER] {} nonce={}", label, nonce);
+
+        // 2 — Build SafeTx and sign with EIP-712 (verifyingContract = safe_addr)
+
+        // Build hex strings before moving calldata
+        let data_hex = format!("0x{}", alloy::hex::encode(&calldata));
+
+        let safe_tx = SafeTx {
+            to: ctf_exchange,
             value: U256::ZERO,
-            data: Bytes::from(calldata),
+            data: Bytes::from(calldata),  // move
             operation: 0,
+            safeTxGas: U256::ZERO,
+            baseGas: U256::ZERO,
+            gasPrice: U256::ZERO,
+            gasToken: Address::ZERO,
+            refundReceiver: Address::ZERO,
+            nonce: U256::from(nonce),
         };
 
-        let submitted = relay.execute(vec![tx], None).await
-            .map_err(|e| anyhow::anyhow!("Relayer execute ({}) failed: {}", label, e))?;
+        let domain = Eip712Domain {
+            name: None,
+            version: None,
+            chain_id: Some(U256::from(137u64)),
+            verifying_contract: Some(safe_addr),
+            salt: None,
+        };
 
-        let tx_id = submitted.transaction_id.to_string();
-        log::info!("[RELAYER] {} submitted. ID: {}", label, tx_id);
+        let struct_hash = safe_tx.eip712_signing_hash(&domain);
+        let sig = signer.sign_message(struct_hash.as_slice()).await?;
 
+        // Pack signature: r (32) + s (32) + v (y_parity + 31, for Safe format)
+        let v_byte = if sig.v() { 1u8 } else { 0u8 } + 31;
+        let mut packed = Vec::with_capacity(65);
+        packed.extend_from_slice(&sig.r().to_be_bytes::<32>());
+        packed.extend_from_slice(&sig.s().to_be_bytes::<32>());
+        packed.push(v_byte);
+        let sig_hex = format!("0x{}", alloy::hex::encode(&packed));
+        let zero_addr = format!("{:#x}", Address::ZERO);
+        let body = serde_json::json!({
+            "type": "SAFE",
+            "from": format!("{:#x}", eoa),
+            "to": format!("{:#x}", ctf_exchange),
+            "proxyWallet": format!("{:#x}", safe_addr),
+            "data": data_hex,
+            "signature": sig_hex,
+            "signatureParams": {
+                "gasPrice": "0",
+                "operation": "0",
+                "safeTxnGas": "0",
+                "baseGas": "0",
+                "gasToken": zero_addr,
+                "refundReceiver": zero_addr
+            },
+            "value": "0",
+            "nonce": nonce.to_string(),
+        });
+
+        log::debug!("[RELAYER] {} body: {:?}", label, body);
+
+        // 4 — POST to /submit with relayer API key auth
+        let submit_resp = client.post(format!("{}/submit", base_url))
+            .headers(auth_headers(relayer_key, relayer_key_addr))
+            .header(reqwest::header::CONTENT_TYPE, content_type.clone())
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to POST to relayer /submit")?;
+
+        let status = submit_resp.status();
+        if !status.is_success() {
+            let text = submit_resp.text().await.unwrap_or_default();
+            anyhow::bail!("Relayer submit failed ({}): {}", status, text);
+        }
+
+        let submit_body: serde_json::Value = submit_resp.json().await
+            .context("Failed to parse /submit response")?;
+        let tx_id = submit_body["transactionID"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("No transactionID in /submit response: {:?}", submit_body))?
+            .to_string();
+        let state = submit_body["state"].as_str().unwrap_or("unknown");
+
+        log::info!("[RELAYER] {} submitted. ID: {}, state: {}", label, tx_id, state);
+
+        // 5 — Poll for confirmation via GET /transaction?id={tx_id}
         let max_polls = 30u32;
         for i in 0..max_polls {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            let tx = relay.get_transaction(&tx_id).await
-                .map_err(|e| anyhow::anyhow!("Polling error: {}", e))?;
-            log::debug!("[RELAYER] {} poll {}/{} -- state: {}", label, i + 1, max_polls, tx.state);
-            if tx.state == "STATE_CONFIRMED" {
-                if let Some(tx_hash) = &tx.transaction_hash {
-                    return Ok(tx_hash.to_string());
+
+            let tx_url = format!("{}/transaction?id={}", base_url, tx_id);
+
+            let poll_resp = client.get(&tx_url)
+                .headers(auth_headers(relayer_key, relayer_key_addr))
+                .send()
+                .await
+                .context("Failed to poll transaction")?;
+
+            if !poll_resp.status().is_success() {
+                log::warn!("[RELAYER] Poll failed: {} (retrying)", poll_resp.status());
+                continue;
+            }
+
+            let tx_data: serde_json::Value = poll_resp.json().await
+                .context("Failed to parse poll response")?;
+            let poll_state = tx_data["state"].as_str().unwrap_or("unknown");
+
+            log::debug!("[RELAYER] {} poll {}/{} -- state: {}", label, i + 1, max_polls, poll_state);
+
+            if poll_state == "STATE_CONFIRMED" || poll_state == "STATE_MINED" {
+                if let Some(tx_hash) = tx_data["transactionHash"].as_str() {
+                    if !tx_hash.is_empty() {
+                        return Ok(tx_hash.to_string());
+                    }
                 }
                 return Ok(tx_id);
             }
-            if tx.state == "STATE_FAILED" {
-                anyhow::bail!("Relayer {} failed: state={:?}", label, tx.state);
+            if poll_state == "STATE_FAILED" {
+                anyhow::bail!("Relayer {} failed (state=STATE_FAILED)", label);
             }
             if i % 5 == 4 {
                 log::info!("[RELAYER] {} still waiting... poll {}/{}", label, i + 1, max_polls);
             }
         }
+
         anyhow::bail!("Relayer {} did not confirm within timeout", label)
     }
 
@@ -1030,5 +1160,44 @@ mod tests {
             "019e4f5f-a080-70df-a93f-34768e702159"
         );
         assert_eq!(resp.secret, "test-secret-value");
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use alloy::primitives::keccak256;
+    #[test]
+    fn print_selectors() {
+        let sig = b"computeProxyAddress(address)";
+        let hash = keccak256(sig);
+        println!("Sig: computeProxyAddress(address)");
+        println!("Full hash: {:#x}", hash);
+        println!("Selector: {:#02x}{:#02x}{:#02x}{:#02x}", hash[0], hash[1], hash[2], hash[3]);
+
+        // Also check getSalt selector
+        let sig2 = b"getSalt(address)";
+        let hash2 = keccak256(sig2);
+        println!("\nSig: getSalt(address)");
+        println!("Selector: {:#02x}{:#02x}{:#02x}{:#02x}", hash2[0], hash2[1], hash2[2], hash2[3]);
+
+        // Also compute abi.encode vs abi.encodePacked
+        use alloy::sol_types::SolValue;
+        use alloy::hex::ToHexExt;
+
+        let eoa: alloy::primitives::Address = "0x2200709f4eeee905a9f463afc92e215630bc6b62".parse().unwrap();
+
+        // abi.encode = left-padded 32 bytes
+        let encoded = (eoa,).abi_encode_params();
+        println!("\nKEccak of abi.encode(eoa) (SDK salt):");
+        println!("encoded: 0x{}", encoded.encode_hex());
+        let salt_abi = keccak256(&encoded);
+        println!("salt: {:#x}", salt_abi);
+
+        // abi.encodePacked = raw 20 bytes
+        let packed = eoa.abi_encode_packed();
+        println!("\nKeccak of abi.encodePacked(eoa) (factory getSalt):");
+        println!("packed: 0x{}", packed.encode_hex());
+        let salt_packed = keccak256(&packed);
+        println!("salt: {:#x}", salt_packed);
     }
 }
