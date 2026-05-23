@@ -10,7 +10,12 @@ use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
+use alloy::dyn_abi::Eip712Domain;
+use alloy::hex::ToHexExt;
+use alloy::sol_types::SolStruct;
 use alloy_sol_types::{sol, SolCall};
+use reqwest::header::HeaderMap;
+use uuid::Uuid;
 
 use polymarket_client_sdk_v2::clob::types::{OrderType, Side, OrderStatusType, SignatureType};
 use polymarket_client_sdk_v2::clob::types::request::{OrdersRequest, PriceRequest};
@@ -55,6 +60,82 @@ sol! {
         uint256[] partition,
         uint256 amount
     );
+
+    /// EIP-712 struct for Polymarket L1 auth (ClobAuthDomain)
+    #[allow(missing_docs)]
+    struct ClobAuth {
+        address address;
+        string  timestamp;
+        uint256 nonce;
+        string  message;
+    }
+}
+
+/// Helper struct to deserialize Polymarket API key creation/derivation response.
+#[derive(serde::Deserialize)]
+struct ApiKeyResponse {
+    #[serde(alias = "apiKey")]
+    key: Uuid,
+    secret: String,
+    passphrase: String,
+}
+
+/// Generate L1 auth headers with `POLY_ADDRESS` set to `funder` (proxy wallet)
+/// instead of the EOA address. This binds the API key to the proxy wallet so
+/// that orders using the proxy wallet as `maker` pass the server's permission check.
+async fn create_funder_l1_headers(
+    signer: &PrivateKeySigner,
+    funder: Address,
+    chain_id: u64,
+    timestamp: i64,
+    nonce: Option<u32>,
+) -> Result<HeaderMap> {
+    let naive_nonce = nonce.unwrap_or(0);
+
+    let auth = ClobAuth {
+        address: funder,
+        timestamp: timestamp.to_string(),
+        nonce: U256::from(naive_nonce),
+        message: "This message attests that I control the given wallet".to_owned(),
+    };
+
+    let domain = Eip712Domain {
+        name: Some(std::borrow::Cow::Borrowed("ClobAuthDomain")),
+        version: Some(std::borrow::Cow::Borrowed("1")),
+        chain_id: Some(U256::from(chain_id)),
+        ..Eip712Domain::default()
+    };
+
+    let hash = auth.eip712_signing_hash(&domain);
+    let signature = signer.sign_hash(&hash).await?;
+
+    let mut map = HeaderMap::new();
+    map.insert(
+        "POLY_ADDRESS",
+        funder.encode_hex_with_prefix().parse().map_err(|e| {
+            anyhow::anyhow!("Failed to parse POLY_ADDRESS header: {}", e)
+        })?,
+    );
+    map.insert(
+        "POLY_NONCE",
+        naive_nonce.to_string().parse().map_err(|e| {
+            anyhow::anyhow!("Failed to parse POLY_NONCE header: {}", e)
+        })?,
+    );
+    map.insert(
+        "POLY_SIGNATURE",
+        signature.to_string().parse().map_err(|e| {
+            anyhow::anyhow!("Failed to parse POLY_SIGNATURE header: {}", e)
+        })?,
+    );
+    map.insert(
+        "POLY_TIMESTAMP",
+        timestamp.to_string().parse().map_err(|e| {
+            anyhow::anyhow!("Failed to parse POLY_TIMESTAMP header: {}", e)
+        })?,
+    );
+
+    Ok(map)
 }
 
 pub struct PolymarketApi {
@@ -173,22 +254,13 @@ impl PolymarketApi {
             _ => SignatureType::Eoa,
         };
 
-        // Derive API credentials scoped to the proxy wallet (funder)
-        let credentials = {
-            let bootstrap = ClobClient::new(
-                &self.clob_url,
-                ClobConfig::default(),
-            )?;
-            bootstrap
-                .create_or_derive_api_key(&signer, None)
-                .await
-                .context("Failed to create/derive API key for proxy wallet")?
-        };
-
+        // Follow the SDK example pattern: authentication_builder with
+        // funder + Poly1271. The SDK internally calls create_or_derive_api_key
+        // during authenticate() to get fresh credentials bound to the EOA,
+        // then sets the funder and signature_type on the inner client.
         let config = ClobConfig::builder().use_server_time(true).build();
         let mut auth_builder = ClobClient::new(&self.clob_url, config)?
-            .authentication_builder(&signer)
-            .credentials(credentials);
+            .authentication_builder(&signer);
 
         if let Some(f) = funder {
             auth_builder = auth_builder.funder(f);
@@ -842,5 +914,121 @@ impl PolymarketApi {
         .abi_encode();
 
         self.execute_relayer_tx(calldata, "Merge").await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    // Known test key (from alloy test vectors)
+    // EOA derived: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+    const TEST_PRIVATE_KEY: &str =
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_FUNDER: &str = "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48";
+
+    #[tokio::test]
+    async fn test_create_funder_l1_headers_contains_all_keys() {
+        let signer = PrivateKeySigner::from_str(TEST_PRIVATE_KEY).unwrap();
+        let funder = Address::from_str(TEST_FUNDER).unwrap();
+        let headers = create_funder_l1_headers(&signer, funder, 137, 10_000_000, Some(42))
+            .await
+            .unwrap();
+
+        assert!(headers.contains_key("POLY_ADDRESS"));
+        assert!(headers.contains_key("POLY_NONCE"));
+        assert!(headers.contains_key("POLY_SIGNATURE"));
+        assert!(headers.contains_key("POLY_TIMESTAMP"));
+    }
+
+    #[tokio::test]
+    async fn test_create_funder_l1_headers_poly_address_is_funder() {
+        let signer = PrivateKeySigner::from_str(TEST_PRIVATE_KEY).unwrap();
+        let eoa = signer.address();
+        let funder = Address::from_str(TEST_FUNDER).unwrap();
+        let headers = create_funder_l1_headers(&signer, funder, 137, 10_000_000, Some(42))
+            .await
+            .unwrap();
+
+        let poly_address = headers.get("POLY_ADDRESS").unwrap().to_str().unwrap();
+        assert_eq!(
+            poly_address,
+            "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48"
+        );
+        assert_ne!(poly_address, &eoa.encode_hex_with_prefix());
+    }
+
+    #[tokio::test]
+    async fn test_create_funder_l1_headers_nonce_and_timestamp() {
+        let signer = PrivateKeySigner::from_str(TEST_PRIVATE_KEY).unwrap();
+        let funder = Address::from_str(TEST_FUNDER).unwrap();
+        let headers = create_funder_l1_headers(&signer, funder, 137, 9_999_999, Some(0))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            headers.get("POLY_NONCE").unwrap().to_str().unwrap(),
+            "0"
+        );
+        assert_eq!(
+            headers.get("POLY_TIMESTAMP").unwrap().to_str().unwrap(),
+            "9999999"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_funder_l1_headers_signature_is_valid() {
+        let signer = PrivateKeySigner::from_str(TEST_PRIVATE_KEY).unwrap();
+        let funder = Address::from_str(TEST_FUNDER).unwrap();
+        let headers = create_funder_l1_headers(&signer, funder, 137, 10_000_000, Some(0))
+            .await
+            .unwrap();
+
+        let sig = headers.get("POLY_SIGNATURE").unwrap().to_str().unwrap();
+        // Should be a valid hex-encoded signature
+        assert!(sig.starts_with("0x"), "Signature should start with 0x, got: {sig}");
+        assert!(sig.len() > 130, "Signature should be valid length, got: {}", sig.len());
+    }
+
+    #[tokio::test]
+    async fn test_create_funder_l1_headers_rejects_invalid_chain_id() {
+        let signer = PrivateKeySigner::from_str(TEST_PRIVATE_KEY).unwrap();
+        let funder = Address::from_str(TEST_FUNDER).unwrap();
+        let result = create_funder_l1_headers(&signer, funder, 999, 10_000_000, None).await;
+        // Should succeed (the function doesn't validate chain_id — the server does)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_api_key_response_deserialization() {
+        let json = r#"{
+            "apiKey": "019e4f5f-a080-70df-a93f-34768e702159",
+            "secret": "test-secret-value",
+            "passphrase": "test-passphrase-value"
+        }"#;
+        let resp: ApiKeyResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.key.to_string(),
+            "019e4f5f-a080-70df-a93f-34768e702159"
+        );
+        assert_eq!(resp.secret, "test-secret-value");
+        assert_eq!(resp.passphrase, "test-passphrase-value");
+    }
+
+    #[test]
+    fn test_api_key_response_deserialization_with_camelcase() {
+        // Test the alias: the API might return "apiKey" (camelCase)
+        let json = r#"{
+            "key": "019e4f5f-a080-70df-a93f-34768e702159",
+            "secret": "test-secret-value",
+            "passphrase": "test-passphrase-value"
+        }"#;
+        let resp: ApiKeyResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.key.to_string(),
+            "019e4f5f-a080-70df-a93f-34768e702159"
+        );
+        assert_eq!(resp.secret, "test-secret-value");
     }
 }

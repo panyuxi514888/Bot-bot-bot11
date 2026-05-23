@@ -7,7 +7,7 @@
     "api_passphrase": "e4128840813a01a62f72f0b383a6009239f2e486afdb63677276808b6bc290d0",
     "private_key": "43a287ab5cd46ab7aca8c157e5c6d5b5db1d0ecc6e37c7b82db090284e360cfb",
     "proxy_wallet_address": "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48",
-    "signature_type": 2,
+    "signature_type": 3,
     "use_relayer": true,
     "relayer_api_key": "019e4540-b8aa-7404-b3be-a9f900e461bb",
     "relayer_api_key_address": "0x2200709f4eeee905a9f463afc92e215630bc6b62"
