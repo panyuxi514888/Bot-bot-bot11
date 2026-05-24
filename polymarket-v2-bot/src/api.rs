@@ -1,10 +1,12 @@
 use crate::models::*;
 use anyhow::{Context, Result};
-use log::{error, warn};
+use log::{error, info, warn};
 use reqwest::Client as ReqwestClient;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::providers::ProviderBuilder;
@@ -14,11 +16,21 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::hex::ToHexExt;
 use alloy::sol_types::{SolStruct, SolValue};
 use alloy_sol_types::{sol, SolCall};
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderValue};
 use uuid::Uuid;
 
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side, OrderStatusType, SignatureType};
+// L2 HMAC auth
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE as BASE64_URL_SAFE;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+use polymarket_client_sdk_v2::auth::ExposeSecret;
+use polymarket_client_sdk_v2::clob::types::{
+    OrderType, Side, OrderStatusType, SignatureType, OrderPayload,
+};
 use polymarket_client_sdk_v2::clob::types::request::{OrdersRequest, PriceRequest};
+use polymarket_client_sdk_v2::clob::types::response::PostOrderResponse;
 use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk_v2::ctf::Client as CtfClient;
 use polymarket_client_sdk_v2::ctf::types::{
@@ -85,6 +97,18 @@ sol! {
         uint256 nonce;
     }
 }
+
+/// Credentials needed for L2 HMAC request signing.
+#[derive(Clone)]
+pub struct L2Credentials {
+    pub address: String,
+    pub api_key: String,
+    pub api_secret: String,
+    pub api_passphrase: String,
+}
+
+/// Cache for pre-signed order JSON bodies, keyed by token_id.
+pub type PresignCache = HashMap<String, Vec<u8>>;
 
 /// Helper struct to deserialize Polymarket API key creation/derivation response.
 #[derive(serde::Deserialize)]
@@ -166,6 +190,10 @@ pub struct PolymarketApi {
     relayer_api_key_address: Option<String>,
     authenticated_clob: Arc<tokio::sync::RwLock<Option<AuthClobClient>>>,
     signer: Arc<tokio::sync::RwLock<Option<PrivateKeySigner>>>,
+    // P0+P1: pre-signed order support
+    pub l2_credentials: tokio::sync::RwLock<Option<L2Credentials>>,
+    pub presign_cache: tokio::sync::Mutex<PresignCache>,
+    warmed_up: AtomicBool,
 }
 
 impl PolymarketApi {
@@ -199,6 +227,9 @@ impl PolymarketApi {
             relayer_api_key_address,
             authenticated_clob: Arc::new(tokio::sync::RwLock::new(None)),
             signer: Arc::new(tokio::sync::RwLock::new(None)),
+            l2_credentials: tokio::sync::RwLock::new(None),
+            presign_cache: tokio::sync::Mutex::new(HashMap::new()),
+            warmed_up: AtomicBool::new(false),
         }
     }
 
@@ -277,6 +308,22 @@ impl PolymarketApi {
 
         let mut guard = self.authenticated_clob.write().await;
         *guard = Some(client);
+
+        // Extract L2 credentials for pre-signed order posting
+        if let Some(ref clob) = *guard {
+            let addr = clob.address().to_checksum(None);
+            let key = clob.credentials().key().to_string();
+            let secret = clob.credentials().secret().expose_secret().to_string();
+            let passphrase = clob.credentials().passphrase().expose_secret().to_string();
+            let mut cred_guard = self.l2_credentials.write().await;
+            *cred_guard = Some(L2Credentials {
+                address: addr,
+                api_key: key,
+                api_secret: secret,
+                api_passphrase: passphrase,
+            });
+            info!("L2 credentials extracted for pre-signed order support");
+        }
 
         let mut signer_guard = self.signer.write().await;
         *signer_guard = Some(signer);
@@ -359,6 +406,237 @@ impl PolymarketApi {
             condition_id, is_resolved, up_wins, down_wins);
 
         Ok((is_resolved, winner, up_wins, down_wins))
+    }
+
+    // ── P0: HTTP connection + SDK cache warmup ──
+
+    /// Warm up HTTP connection and SDK caches. Call once after authenticate().
+    pub async fn warmup(&self) -> Result<()> {
+        if self.warmed_up.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let ts_url = format!("{}time", self.clob_url);
+        let _ = self.client.get(&ts_url).send().await?;
+        info!("[WARMUP] HTTP connection warmed via GET /time");
+        // Warm SDK version cache via a light authenticated call
+        if let Some(ref clob) = *self.authenticated_clob.read().await {
+            let _ = clob.server_time().await?;
+            info!("[WARMUP] SDK server-time cache warmed");
+        }
+        self.warmed_up.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    // ── P1: Pre-signed order support ──
+
+    /// Build + sign a SELL limit order (GTD 360s) and cache its serialized JSON.
+    pub async fn presign_order(&self, token_id: &str, price: f64, size: f64) -> Result<()> {
+        let clob = self.get_clob_client().await?;
+        let signer = self.get_signer().await?;
+
+        let tid = U256::from_str(token_id)
+            .context(format!("Invalid token_id: {}", token_id))?;
+        let price_dec = Decimal::from_str(&format!("{:.2}", price))
+            .context("Invalid price")?;
+        let size_dec = Decimal::from_str(&format!("{:.2}", size))
+            .context("Invalid size")?;
+
+        let expiration = chrono::Utc::now() + chrono::Duration::seconds(360);
+
+        let signable = clob
+            .limit_order()
+            .token_id(tid)
+            .size(size_dec)
+            .price(price_dec)
+            .side(Side::Sell)
+            .order_type(OrderType::GTD)
+            .expiration(expiration)
+            .build()
+            .await?;
+
+        let signed = clob.sign(&signer, signable).await?;
+        let json_bytes = serde_json::to_vec(&signed)?;
+
+        let mut cache = self.presign_cache.lock().await;
+        cache.insert(token_id.to_string(), json_bytes);
+        info!("[PRESIGN] Cached SELL order for token {}", token_id);
+        Ok(())
+    }
+
+    /// Low-level: POST JSON bytes to /order with fresh L2 HMAC headers.
+    /// Returns the raw HTTP status code and response body text.
+    async fn post_presigned_body(&self, body: Vec<u8>) -> Result<(u16, String)> {
+        let creds = self
+            .l2_credentials
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("L2 credentials not available"))?;
+
+        let url = format!("{}/order", self.clob_url.trim_end_matches('/'));
+        let body_str = std::str::from_utf8(&body)
+            .context("Pre-signed order is not valid UTF-8")?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("Clock error: {}", e))?
+            .as_secs() as i64;
+
+        // ---- L2 HMAC computation (same algorithm as SDK auth::l2) ----
+        let message = format!("{}POST/order{}", timestamp, body_str);
+        let decoded_secret = BASE64_URL_SAFE
+            .decode(&creds.api_secret)
+            .context("Failed to base64-decode API secret")?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&decoded_secret)?;
+        mac.update(message.as_bytes());
+        let signature = BASE64_URL_SAFE.encode(mac.finalize().into_bytes());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("POLY_ADDRESS", HeaderValue::from_str(&creds.address)?);
+        headers.insert("POLY_API_KEY", HeaderValue::from_str(&creds.api_key)?);
+        headers.insert(
+            "POLY_PASSPHRASE",
+            HeaderValue::from_str(&creds.api_passphrase)?,
+        );
+        headers.insert("POLY_SIGNATURE", HeaderValue::from_str(&signature)?);
+        headers.insert(
+            "POLY_TIMESTAMP",
+            HeaderValue::from_str(&timestamp.to_string())?,
+        );
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .context("Failed to send pre-signed order")?;
+
+        let status_code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Ok((status_code.as_u16(), text))
+    }
+
+    /// Post a previously pre-signed order via L2 HMAC auth.
+    /// Removes the cached entry afterwards (one-shot).
+    /// Returns `None` when no pre-signed order exists for this token_id.
+    pub async fn try_post_presigned(&self, token_id: &str) -> Result<Option<OrderResponse>> {
+        let json_bytes = {
+            let mut cache = self.presign_cache.lock().await;
+            cache.remove(token_id)
+        };
+        let body = match json_bytes {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+
+        let (status_code, text) = self.post_presigned_body(body).await?;
+
+        if status_code >= 400 {
+            anyhow::bail!(
+                "Pre-signed order rejected ({}): {}",
+                status_code,
+                text
+            );
+        }
+
+        let post_resp: PostOrderResponse = serde_json::from_str(&text)
+            .context("Failed to parse order response")?;
+
+        if !post_resp.success {
+            let msg = post_resp
+                .error_msg
+                .as_deref()
+                .unwrap_or("Unknown error");
+            anyhow::bail!("Pre-signed order rejected: {}", msg);
+        }
+
+        info!(
+            "[PRESIGN] Order posted! ID: {}",
+            post_resp.order_id
+        );
+        Ok(Some(OrderResponse {
+            order_id: Some(post_resp.order_id.clone()),
+            status: post_resp.status.to_string(),
+            message: Some(format!("Order ID: {}", post_resp.order_id)),
+        }))
+    }
+
+    pub async fn clear_presign_cache(&self) {
+        let mut cache = self.presign_cache.lock().await;
+        cache.clear();
+    }
+
+    /// Test pre-signed order with deliberately old timestamp (10 minutes in the past).
+    /// Builds + signs and posts with fresh L2 HMAC headers to check server acceptance.
+    pub async fn test_presigned_order(
+        &self,
+        token_id: &str,
+        side: Side,
+        price: f64,
+        size: f64,
+    ) -> Result<String> {
+        let clob = self.get_clob_client().await?;
+        let signer = self.get_signer().await?;
+
+        let tid = U256::from_str(token_id)
+            .context(format!("Invalid token_id: {}", token_id))?;
+        let price_dec = Decimal::from_str(&format!("{:.2}", price))
+            .context("Invalid price")?;
+        let size_dec = Decimal::from_str(&format!("{:.2}", size))
+            .context("Invalid size")?;
+
+        let expiration = chrono::Utc::now() + chrono::Duration::seconds(360);
+
+        let mut signable = clob
+            .limit_order()
+            .token_id(tid)
+            .size(size_dec)
+            .price(price_dec)
+            .side(side)
+            .order_type(OrderType::GTD)
+            .expiration(expiration)
+            .build()
+            .await?;
+
+        // Override timestamp to 10 minutes ago to test server tolerance
+        let old_timestamp_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            .saturating_sub(600_000);
+
+        if let OrderPayload::V2(ref mut v2) = signable.payload {
+            v2.order.timestamp = U256::from(old_timestamp_ms);
+            info!(
+                "[TEST-PRESIGN] Set order timestamp to {} ({} ms ago)",
+                old_timestamp_ms, 600_000u64
+            );
+        }
+
+        let signed = clob.sign(&signer, signable).await?;
+        let json_bytes = serde_json::to_vec(&signed)?;
+
+        info!(
+            "[TEST-PRESIGN] Signed order JSON ({} bytes), posting with old timestamp...",
+            json_bytes.len()
+        );
+        eprintln!(
+            "Sending pre-signed {} order: {} shares @ ${:.2} (10-min-old timestamp)",
+            if side == Side::Buy { "BUY" } else { "SELL" },
+            size,
+            price,
+        );
+
+        let (status_code, response_text) = self.post_presigned_body(json_bytes).await?;
+
+        eprintln!("Server response: HTTP {} — {}", status_code, response_text);
+        info!("[TEST-PRESIGN] HTTP {} — {}", status_code, response_text);
+        Ok(format!("HTTP {} — {}", status_code, response_text))
     }
 
     pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {

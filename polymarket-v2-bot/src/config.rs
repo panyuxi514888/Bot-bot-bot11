@@ -21,6 +21,18 @@ pub struct Args {
 
     #[arg(long, requires = "redeem")]
     pub condition_id: Option<String>,
+
+    /// Test a pre-signed order with deliberately old timestamp
+    #[arg(long)]
+    pub test_presign: bool,
+
+    /// Token ID to use for --test-presign (auto-discover if omitted)
+    #[arg(long, requires = "test_presign")]
+    pub test_token_id: Option<String>,
+
+    /// Side for --test-presign: "BUY" or "SELL" (default: BUY)
+    #[arg(long, default_value = "BUY", requires = "test_presign")]
+    pub test_side: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

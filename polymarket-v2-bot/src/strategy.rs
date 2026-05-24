@@ -454,6 +454,19 @@ impl PreLimitStrategy {
                             .place_limit_order(&down_token_id, "BUY", buy_price)
                             .await?;
 
+                        // P1: Pre-sign SELL orders immediately after placing BUY orders
+                        if !self.config.strategy.simulation_mode {
+                            let sell_price = self.config.strategy.sell_price;
+                            let shares = self.config.strategy.shares;
+                            info!("[PRESIGN] Pre-signing SELL orders ({} shares @ ${:.2})", shares, sell_price);
+                            if let Err(e) = self.api.presign_order(&up_token_id, sell_price, shares).await {
+                                warn!("[PRESIGN] Failed to pre-sign UP SELL: {}", e);
+                            }
+                            if let Err(e) = self.api.presign_order(&down_token_id, sell_price, shares).await {
+                                warn!("[PRESIGN] Failed to pre-sign DOWN SELL: {}", e);
+                            }
+                        }
+
                         let new_state = PreLimitOrderState {
                             asset: "BTC".to_string(),
                             condition_id: market.condition_id,
@@ -655,26 +668,51 @@ impl PreLimitStrategy {
                                                         if should_place_sell {
                                                             let side_name = if outcome.to_lowercase() == "up" { "UP" } else { "DOWN" };
                                                             info!("Placing SELL order for {} with {} shares", side_name, shares);
-                                                            
-                                                            let token_id = if outcome.to_lowercase() == "up" { 
+
+                                                            let token_id = if outcome.to_lowercase() == "up" {
                                                                 s.up_token_id.clone()
-                                                            } else { 
-                                                                s.down_token_id.clone() 
+                                                            } else {
+                                                                s.down_token_id.clone()
                                                             };
                                                             let sell_price = config.strategy.sell_price;
                                                             let expire_after = chrono::Utc::now().timestamp() + GTD_DURATION_SECS;
-                                                            let order = OrderRequest {
-                                                                token_id: token_id.clone(),
-                                                                side: "SELL".to_string(),
-                                                                size: shares.to_string(),
-                                                                price: format!("{:.2}", sell_price),
-                                                                order_type: "LIMIT".to_string(),
-                                                                time_in_force: Some("GTD".to_string()),
-                                                                expire_after: Some(expire_after),
+
+                                                            // P1: Try pre-signed order first, fall back to SDK place_order
+                                                            let sell_result = match api.try_post_presigned(&token_id).await {
+                                                                Ok(Some(resp)) => {
+                                                                    info!("[PRESIGN] Used pre-signed order for {}, ID: {:?}", side_name, resp.order_id);
+                                                                    Some(resp)
+                                                                }
+                                                                Ok(None) => {
+                                                                    // No pre-signed order cached, fall through to normal flow
+                                                                    let order = OrderRequest {
+                                                                        token_id: token_id.clone(),
+                                                                        side: "SELL".to_string(),
+                                                                        size: shares.to_string(),
+                                                                        price: format!("{:.2}", sell_price),
+                                                                        order_type: "LIMIT".to_string(),
+                                                                        time_in_force: Some("GTD".to_string()),
+                                                                        expire_after: Some(expire_after),
+                                                                    };
+                                                                    api.place_order(&order).await.ok()
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!("[PRESIGN] Pre-signed order failed: {}. Falling back to SDK place_order.", e);
+                                                                    let order = OrderRequest {
+                                                                        token_id: token_id.clone(),
+                                                                        side: "SELL".to_string(),
+                                                                        size: shares.to_string(),
+                                                                        price: format!("{:.2}", sell_price),
+                                                                        order_type: "LIMIT".to_string(),
+                                                                        time_in_force: Some("GTD".to_string()),
+                                                                        expire_after: Some(expire_after),
+                                                                    };
+                                                                    api.place_order(&order).await.ok()
+                                                                }
                                                             };
-                                                            
-                                                            match api.place_order(&order).await {
-                                                                Ok(sell_order) => {
+
+                                                            match sell_result {
+                                                                Some(sell_order) => {
                                                                     let order_id = sell_order.order_id.unwrap_or_default();
                                                                     if outcome.to_lowercase() == "up" {
                                                                         s.up_sell_order_id = Some(order_id.clone());
@@ -683,8 +721,8 @@ impl PreLimitStrategy {
                                                                     }
                                                                     info!("SELL order placed for {}: order_id={}", side_name, order_id);
                                                                 }
-                                                                Err(e) => {
-                                                                    error!("Failed to place SELL for {}: {}", side_name, e);
+                                                                None => {
+                                                                    error!("Failed to place SELL for {} (both pre-signed and fallback failed)", side_name);
                                                                 }
                                                             }
                                                         }
@@ -1101,38 +1139,58 @@ impl PreLimitStrategy {
 
                 if should_place_sell {
                     let side_name = if outcome.to_lowercase() == "up" { "UP" } else { "DOWN" };
-                    let token_id = if outcome.to_lowercase() == "up" { 
+                    let token_id = if outcome.to_lowercase() == "up" {
                         up_token_id.clone()
-                    } else { 
-                        down_token_id.clone() 
+                    } else {
+                        down_token_id.clone()
                     };
                     let sell_price = config.strategy.sell_price;
                     info!("Placing SELL order for pending trade {} with {} shares", side_name, shares);
-                    let size_str = shares.to_string();
                     let expire_after = chrono::Utc::now().timestamp() + GTD_DURATION_SECS;
-                    let order = OrderRequest {
-                        token_id: token_id.clone(),
-                        side: "SELL".to_string(),
-                        size: size_str,
-                        price: format!("{:.2}", sell_price),
-                        order_type: "LIMIT".to_string(),
-                        time_in_force: Some("GTD".to_string()),
-                        expire_after: Some(expire_after),
-                    };
 
-                    match api.place_order(&order).await {
-                        Ok(sell_order) => {
-                            let order_id = sell_order.order_id.unwrap_or_default();
-                            if outcome.to_lowercase() == "up" {
-                                up_sell_order_id = Some(order_id.clone());
-                            } else {
-                                down_sell_order_id = Some(order_id.clone());
-                            }
-                            info!("SELL order placed for {}: order_id={}", side_name, order_id);
+                    // P1: Try pre-signed order first, fall back to SDK place_order
+                    let sell_result = match api.try_post_presigned(&token_id).await {
+                        Ok(Some(resp)) => {
+                            info!("[PRESIGN] Used pre-signed order for {} (pending trade), ID: {:?}", side_name, resp.order_id);
+                            Some(resp)
+                        }
+                        Ok(None) => {
+                            let order = OrderRequest {
+                                token_id: token_id.clone(),
+                                side: "SELL".to_string(),
+                                size: shares.to_string(),
+                                price: format!("{:.2}", sell_price),
+                                order_type: "LIMIT".to_string(),
+                                time_in_force: Some("GTD".to_string()),
+                                expire_after: Some(expire_after),
+                            };
+                            api.place_order(&order).await.ok()
                         }
                         Err(e) => {
-                            error!("Failed to place SELL for {}: {}", side_name, e);
+                            warn!("[PRESIGN] Pre-signed order failed (pending trade): {}. Falling back.", e);
+                            let order = OrderRequest {
+                                token_id: token_id.clone(),
+                                side: "SELL".to_string(),
+                                size: shares.to_string(),
+                                price: format!("{:.2}", sell_price),
+                                order_type: "LIMIT".to_string(),
+                                time_in_force: Some("GTD".to_string()),
+                                expire_after: Some(expire_after),
+                            };
+                            api.place_order(&order).await.ok()
                         }
+                    };
+
+                    if let Some(sell_order) = sell_result {
+                        let order_id = sell_order.order_id.unwrap_or_default();
+                        if outcome.to_lowercase() == "up" {
+                            up_sell_order_id = Some(order_id.clone());
+                        } else {
+                            down_sell_order_id = Some(order_id.clone());
+                        }
+                        info!("SELL order placed for {}: order_id={}", side_name, order_id);
+                    } else {
+                        error!("Failed to place SELL for {} (both pre-signed and fallback failed)", side_name);
                     }
                 }
             } else {

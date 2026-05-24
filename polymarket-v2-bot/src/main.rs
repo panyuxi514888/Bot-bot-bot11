@@ -9,7 +9,9 @@ use anyhow::Result;
 use api::PolymarketApi;
 use clap::Parser;
 use config::{Args, Config};
-use log::{warn, LevelFilter};
+use discovery::MarketDiscovery;
+use log::{info, warn, LevelFilter};
+use polymarket_client_sdk_v2::clob::types::Side;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -112,6 +114,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.test_presign {
+        return run_test_presign(api.as_ref(), &config, &args).await;
+    }
+
     if config.polymarket.private_key.is_some() {
         if let Err(e) = api.authenticate().await {
             log::error!("认证失败: {}", e);
@@ -188,5 +194,60 @@ async fn run_redeem_only(
         }
     }
     eprintln!("\n赎回完成。成功: {}, 失败: {}", ok_count, fail_count);
+    Ok(())
+}
+
+async fn run_test_presign(api: &PolymarketApi, config: &Config, args: &Args) -> Result<()> {
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("预签名旧timestamp订单测试");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Authenticate first (required for L2 credentials and CLOB client)
+    if let Err(e) = api.authenticate().await {
+        log::error!("认证失败: {}", e);
+        anyhow::bail!("认证失败，请检查凭证。");
+    }
+    info!("[TEST-PRESIGN] Authentication successful");
+
+    // Discover market token if not provided
+    let token_id = if let Some(ref tid) = args.test_token_id {
+        tid.clone()
+    } else {
+        let period_start = MarketDiscovery::current_5m_period_start_et();
+        let slug = MarketDiscovery::build_5m_slug("BTC", period_start);
+        info!("[TEST-PRESIGN] Discovering market via slug: {}", slug);
+        let market = api.get_market_by_slug(&slug).await
+            .map_err(|e| anyhow::anyhow!("Failed to find BTC market: {}", e))?;
+        let details = api.get_market(&market.condition_id).await
+            .map_err(|e| anyhow::anyhow!("Failed to get market details: {}", e))?;
+        let token = details.tokens.first()
+            .ok_or_else(|| anyhow::anyhow!("No tokens found in market"))?;
+        info!("[TEST-PRESIGN] Using token_id: {} (outcome: {})", token.token_id, token.outcome);
+        token.token_id.clone()
+    };
+
+    let side = if args.test_side.to_uppercase() == "SELL" {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+
+    let price = config.strategy.buy_price;
+    let shares = config.strategy.shares;
+
+    eprintln!("Test parameters:");
+    eprintln!("  Token ID: {}", token_id);
+    eprintln!("  Side: {}", if side == Side::Buy { "BUY" } else { "SELL" });
+    eprintln!("  Price: ${:.2}", price);
+    eprintln!("  Shares: {:.0}", shares);
+    eprintln!("  Timestamp: 10 minutes in the past");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let result = api.test_presigned_order(&token_id, side, price, shares).await?;
+
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("测试结果: {}", result);
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
     Ok(())
 }

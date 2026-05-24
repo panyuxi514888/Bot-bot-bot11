@@ -32,3 +32,6 @@ regex = "1.10"
 polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", features = ["clob", "ws", "ctf", "gamma"] }
 polyoxide-relay = "0.15"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
