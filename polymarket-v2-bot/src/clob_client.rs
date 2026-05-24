@@ -62,6 +62,20 @@ impl ClobClient {
         })
     }
 
+    /// Resolve the address used for WS authentication.
+    /// Uses proxy_wallet_address if set, otherwise falls back to derived Safe address.
+    fn resolve_ws_address(config: &Config) -> anyhow::Result<String> {
+        if let Some(proxy) = &config.polymarket.proxy_wallet_address {
+            return Ok(proxy.clone());
+        }
+        let pk = config
+            .polymarket
+            .private_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No private_key or proxy_wallet_address configured"))?;
+        crate::config::derive_polymarket_address(pk)
+    }
+
     async fn create_authenticated_client(config: &Config) -> Result<AuthWsClient> {
         let private_key = config
             .polymarket
@@ -71,7 +85,7 @@ impl ClobClient {
 
         let (api_key, api_secret, api_passphrase) =
             crate::config::derive_api_credentials(private_key).await?;
-        let address = crate::config::derive_polymarket_address(private_key)?;
+        let address = Self::resolve_ws_address(config)?;
 
         info!("Address: {}", address);
 
@@ -198,5 +212,63 @@ impl ClobClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config() -> Config {
+        Config {
+            polymarket: crate::config::PolymarketConfig {
+                private_key: Some(
+                    "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string(),
+                ),
+                proxy_wallet_address: None,
+                clob_api_url: "https://clob.polymarket.com".to_string(),
+                gamma_api_url: "https://gamma-api.polymarket.com".to_string(),
+                signature_type: Some(3),
+                use_relayer: false,
+                relayer_api_key: None,
+                relayer_api_key_address: None,
+            },
+            strategy: crate::config::StrategyConfig {
+                buy_price: 0.01,
+                sell_price: 0.02,
+                shares: 5.0,
+                simulation_mode: true,
+                market_closure_check_interval_seconds: 300,
+                check_interval_ms: 100,
+            },
+            rpc: Some("https://polygon-rpc.com".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_resolve_ws_address_prefers_proxy_wallet() {
+        let mut config = minimal_config();
+        config.polymarket.proxy_wallet_address =
+            Some("0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48".to_string());
+        let addr = ClobClient::resolve_ws_address(&config).unwrap();
+        assert_eq!(addr, "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48");
+    }
+
+    #[test]
+    fn test_resolve_ws_address_falls_back_to_derived() {
+        let config = minimal_config();
+        let addr = ClobClient::resolve_ws_address(&config).unwrap();
+        // Derived address should be a valid hex address starting with 0x
+        assert!(addr.starts_with("0x"));
+        assert_eq!(addr.len(), 42);
+    }
+
+    #[test]
+    fn test_resolve_ws_errors_without_pk_or_proxy() {
+        let mut config = minimal_config();
+        config.polymarket.private_key = None;
+        config.polymarket.proxy_wallet_address = None;
+        let result = ClobClient::resolve_ws_address(&config);
+        assert!(result.is_err());
     }
 }
