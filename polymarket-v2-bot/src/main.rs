@@ -123,6 +123,10 @@ async fn main() -> Result<()> {
             log::error!("认证失败: {}", e);
             anyhow::bail!("认证失败，请检查凭证。");
         }
+        // P0: Warm up HTTP connection pool + SDK caches before trading starts
+        if let Err(e) = api.warmup().await {
+            log::warn!("预热失败（不影响运行）: {}", e);
+        }
     } else {
         log::warn!("未提供私钥，机器人将仅监控市场。");
     }

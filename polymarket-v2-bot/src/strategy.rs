@@ -382,14 +382,14 @@ impl PreLimitStrategy {
                                     .get_market_tokens(&next_market.condition_id)
                                     .await?;
                                 info!(
-                                    "Pre-buying next period tokens ({}) at market price",
+                                    "Pre-buying next period tokens ({}) with limit order at 0.51",
                                     &next_market.condition_id[..16]
                                 );
-                                if let Err(e) = self.place_market_order(&next_up, "BUY").await {
-                                    warn!("Next period UP market buy failed: {}", e);
+                                if let Err(e) = self.place_limit_order(&next_up, "BUY", 0.51).await {
+                                    warn!("Next period UP limit buy at 0.51 failed: {}", e);
                                 }
-                                if let Err(e) = self.place_market_order(&next_down, "BUY").await {
-                                    warn!("Next period DOWN market buy failed: {}", e);
+                                if let Err(e) = self.place_limit_order(&next_down, "BUY", 0.51).await {
+                                    warn!("Next period DOWN limit buy at 0.51 failed: {}", e);
                                 }
                             }
                             Ok(None) => {
@@ -617,7 +617,7 @@ impl PreLimitStrategy {
                                     match trade.status {
                                         TradeMessageStatus::Matched => {
                                             // Trade matched on CLOB (链下撮合引擎成交) - immediate trigger
-                                            // This is ~18ms after order placement vs 4.2s for Mined
+                                            let match_instant = std::time::Instant::now();
 
                                             // Trade events don't have outcome field - look up via trade_id from trade_info map
                                             let trade_id = &trade.id;
@@ -719,7 +719,9 @@ impl PreLimitStrategy {
                                                                     } else {
                                                                         s.down_sell_order_id = Some(order_id.clone());
                                                                     }
-                                                                    info!("SELL order placed for {}: order_id={}", side_name, order_id);
+                                                                    let latency_us = match_instant.elapsed().as_micros();
+                                                                    info!("[LATENCY] Match→Sell posted for {}: {}μs (order_id={})", side_name, latency_us, order_id);
+                                                                    eprintln!("  ⚡ 从撮合到卖单: {}μs ({}ms)", latency_us, latency_us / 1000);
                                                                 }
                                                                 None => {
                                                                     error!("Failed to place SELL for {} (both pre-signed and fallback failed)", side_name);
@@ -1139,6 +1141,7 @@ impl PreLimitStrategy {
 
                 if should_place_sell {
                     let side_name = if outcome.to_lowercase() == "up" { "UP" } else { "DOWN" };
+                    let pending_instant = std::time::Instant::now();
                     let token_id = if outcome.to_lowercase() == "up" {
                         up_token_id.clone()
                     } else {
@@ -1188,7 +1191,9 @@ impl PreLimitStrategy {
                         } else {
                             down_sell_order_id = Some(order_id.clone());
                         }
+                        let latency_us = pending_instant.elapsed().as_micros();
                         info!("SELL order placed for {}: order_id={}", side_name, order_id);
+                        info!("[LATENCY] Pending-trade→Sell for {}: {}μs ({}ms)", side_name, latency_us, latency_us / 1000);
                     } else {
                         error!("Failed to place SELL for {} (both pre-signed and fallback failed)", side_name);
                     }

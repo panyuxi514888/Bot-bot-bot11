@@ -415,7 +415,7 @@ impl PolymarketApi {
         if self.warmed_up.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let ts_url = format!("{}time", self.clob_url);
+        let ts_url = format!("{}/time", self.clob_url.trim_end_matches('/'));
         let _ = self.client.get(&ts_url).send().await?;
         info!("[WARMUP] HTTP connection warmed via GET /time");
         // Warm SDK version cache via a light authenticated call
