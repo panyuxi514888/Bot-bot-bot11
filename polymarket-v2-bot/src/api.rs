@@ -1075,6 +1075,19 @@ impl PolymarketApi {
         _token_id: &str,
         outcome: &str,
     ) -> Result<RedeemResponse> {
+        if self.use_relayer {
+            let tx_hash = self.redeem_via_sdk_relayer(
+                &self.get_relay_client().await?,
+                condition_id,
+            ).await?;
+            return Ok(RedeemResponse {
+                success: true,
+                message: Some(format!("Redeemed via relayer. TX: {}", tx_hash)),
+                transaction_hash: Some(tx_hash),
+                amount_redeemed: None,
+            });
+        }
+
         let signer = self.create_signer()?;
         let rpc_url = self.get_rpc_url();
 
