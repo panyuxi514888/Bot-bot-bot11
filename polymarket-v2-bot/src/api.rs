@@ -204,8 +204,8 @@ fn parse_condition_id(condition_id: &str) -> Result<[u8; 32]> {
 }
 
 /// Convert f64 dollar amount to U256 wei (USDC has 6 decimals).
-fn amount_to_u256(amount: f64) -> alloy::primitives::U256 {
-    alloy::primitives::U256::from((amount * 1_000_000.0) as u64)
+fn amount_to_u256(amount: f64) -> ethers::types::U256 {
+    ethers::types::U256::from((amount * 1_000_000.0) as u64)
 }
 
 pub struct PolymarketApi {
@@ -482,6 +482,55 @@ impl PolymarketApi {
         }
 
         Ok(client)
+    }
+
+    /// Split USDC into conditional tokens via relayer (gasless).
+    async fn split_via_sdk_relayer(
+        &self,
+        client: &RelayClient,
+        condition_id: &str,
+        amount: f64,
+    ) -> Result<String> {
+        let cid = parse_condition_id(condition_id)?;
+        let amt = amount_to_u256(amount);
+        let tx = polymarket_relayer::operations::split_regular(cid, &[1, 2], amt);
+        let handle = client.execute(vec![tx], "Split").await
+            .context("Relayer split execute failed")?;
+        let result = handle.wait().await
+            .context("Relayer split wait failed")?;
+        Ok(format!("{:?}", result.tx_hash))
+    }
+
+    /// Merge conditional tokens back to USDC via relayer (gasless).
+    async fn merge_via_sdk_relayer(
+        &self,
+        client: &RelayClient,
+        condition_id: &str,
+        amount: f64,
+    ) -> Result<String> {
+        let cid = parse_condition_id(condition_id)?;
+        let amt = amount_to_u256(amount);
+        let tx = polymarket_relayer::operations::merge_regular(cid, &[1, 2], amt);
+        let handle = client.execute(vec![tx], "Merge").await
+            .context("Relayer merge execute failed")?;
+        let result = handle.wait().await
+            .context("Relayer merge wait failed")?;
+        Ok(format!("{:?}", result.tx_hash))
+    }
+
+    /// Redeem winning tokens via relayer (gasless).
+    async fn redeem_via_sdk_relayer(
+        &self,
+        client: &RelayClient,
+        condition_id: &str,
+    ) -> Result<String> {
+        let cid = parse_condition_id(condition_id)?;
+        let tx = polymarket_relayer::operations::redeem_regular(cid, &[1, 2]);
+        let handle = client.execute(vec![tx], "Redeem").await
+            .context("Relayer redeem execute failed")?;
+        let result = handle.wait().await
+            .context("Relayer redeem wait failed")?;
+        Ok(format!("{:?}", result.tx_hash))
     }
 
     // ── P1: Pre-signed order support ──
