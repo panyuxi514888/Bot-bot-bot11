@@ -8,14 +8,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::hex::ToHexExt;
-use alloy::sol_types::{SolStruct, SolValue};
-use alloy_sol_types::{sol, SolCall};
+use alloy::sol_types::SolStruct;
+use alloy_sol_types::sol;
 use reqwest::header::{HeaderMap, HeaderValue};
 use uuid::Uuid;
 
@@ -41,8 +41,7 @@ use polymarket_client_sdk_v2::{POLYGON, contract_config};
 
 // Relayer SDK (gasless CTF operations via Builder/Relayer API)
 use polymarket_relayer::{
-    AuthMethod, DirectExecutor, RelayClient, RelayerError, RelayerTxType,
-    operations,
+    AuthMethod, RelayClient, RelayerTxType,
 };
 
 // Type alias for authenticated v2 CLOB client
