@@ -1016,7 +1016,11 @@ impl PolymarketApi {
 
     pub async fn merge_shares(&self, condition_id: &str, amount: f64) -> Result<String> {
         if self.use_relayer {
-            return self.merge_shares_via_relayer(condition_id, amount).await;
+            return self.merge_via_sdk_relayer(
+                &self.get_relay_client().await?,
+                condition_id,
+                amount,
+            ).await;
         }
 
         let signer = self.create_signer()?;
