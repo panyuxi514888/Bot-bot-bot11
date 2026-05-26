@@ -458,6 +458,32 @@ impl PolymarketApi {
         Ok(())
     }
 
+    // ── Relayer SDK: lazy-init RelayClient ──
+
+    /// Create or return a cached RelayClient for gasless CTF operations.
+    /// The client is configured as Proxy wallet type (Magic.link / Poly1271).
+    async fn get_relay_client(&self) -> Result<RelayClient> {
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key required for relayer operations"))?;
+        let wallet: ethers::signers::LocalWallet = private_key.parse()
+            .context("Failed to parse private key as ethers LocalWallet")?;
+
+        let auth = AuthMethod::relayer_key(
+            self.relayer_api_key.as_deref().unwrap_or(""),
+            self.relayer_api_key_address.as_deref().unwrap_or(""),
+        );
+
+        let tx_type = relayer_tx_type(self.signature_type);
+        let mut client = RelayClient::new(137, wallet, auth, tx_type).await
+            .context("Failed to create RelayClient")?;
+
+        if let Some(ref rpc) = self.rpc_url {
+            client.set_rpc_url(rpc.clone());
+        }
+
+        Ok(client)
+    }
+
     // ── P1: Pre-signed order support ──
 
     /// Build + sign a SELL limit order (GTD 360s) and cache its serialized JSON.
