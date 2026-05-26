@@ -39,6 +39,12 @@ use polymarket_client_sdk_v2::ctf::types::{
 use polymarket_client_sdk_v2::types::Decimal;
 use polymarket_client_sdk_v2::{POLYGON, contract_config};
 
+// Relayer SDK (gasless CTF operations via Builder/Relayer API)
+use polymarket_relayer::{
+    AuthMethod, DirectExecutor, RelayClient, RelayerError, RelayerTxType,
+    operations,
+};
+
 // Type alias for authenticated v2 CLOB client
 type AuthClobClient = polymarket_client_sdk_v2::clob::Client<
     polymarket_client_sdk_v2::auth::state::Authenticated<
@@ -175,6 +181,31 @@ async fn create_funder_l1_headers(
     );
 
     Ok(map)
+}
+
+/// Map config signature_type to SDK's RelayerTxType.
+/// SDK only handles 0/1/2; we add 3 (Poly1271) → Proxy.
+fn relayer_tx_type(signature_type: Option<u8>) -> RelayerTxType {
+    match signature_type {
+        Some(1) | Some(3) => RelayerTxType::Proxy,
+        Some(2) => RelayerTxType::Safe,
+        _ => RelayerTxType::Eoa,
+    }
+}
+
+/// Convert "0x..." condition_id string to [u8; 32].
+fn parse_condition_id(condition_id: &str) -> Result<[u8; 32]> {
+    let hex_str = condition_id.strip_prefix("0x").unwrap_or(condition_id);
+    let bytes = hex::decode(hex_str)
+        .context("Invalid condition_id hex")?;
+    let mut cid = [0u8; 32];
+    cid.copy_from_slice(&bytes);
+    Ok(cid)
+}
+
+/// Convert f64 dollar amount to U256 wei (USDC has 6 decimals).
+fn amount_to_u256(amount: f64) -> alloy::primitives::U256 {
+    alloy::primitives::U256::from((amount * 1_000_000.0) as u64)
 }
 
 pub struct PolymarketApi {
