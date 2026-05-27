@@ -1,2 +1,4 @@
 target/
 .mcp.json
+*.log
+config.json
