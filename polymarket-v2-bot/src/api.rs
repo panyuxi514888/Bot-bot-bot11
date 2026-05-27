@@ -49,8 +49,7 @@ use polymarket_relayer::{
 /// DepositWalletFactory address on Polygon.
 const DEPOSIT_WALLET_FACTORY: &str = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07";
 
-/// pUSD (Polymarket USD) on Polygon.
-const PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+
 
 /// EIP-712 typehash for Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)
 /// EIP-712 typehash for Batch with Call dependency appended per EIP-712 encodeType:
@@ -466,6 +465,33 @@ impl PolymarketApi {
         Ok(())
     }
 
+    /// Setup V2 approvals (pUSD to Adapter, CTF to Adapter)
+    /// Only necessary once for V2 wallets
+    pub async fn setup_v2_approvals(&self) -> Result<()> {
+        if self.signature_type != Some(2) && self.signature_type != Some(3) {
+            return Ok(()); // Only needed for Deposit Wallet
+        }
+        if !self.use_relayer {
+            anyhow::bail!("Relayer must be enabled for V2 approvals");
+        }
+        info!("[SETUP] Sending V2 approvals for DepositWallet...");
+        let client = self.get_relay_client().await?;
+        let tx1 = polymarket_relayer::approve_pusd_for_ctf_adapter();
+        let tx2 = polymarket_relayer::approve_ctf_for_ctf_adapter();
+        
+        use polymarket_relayer::DepositWalletCall;
+        let calls: Vec<DepositWalletCall> = vec![tx1.into(), tx2.into()];
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("Time error: {e}"))?
+            .as_secs() + 240;
+            
+        let handle = client.execute_deposit_wallet_batch(calls, None, deadline, Some("Approve")).await?;
+        let res = handle.wait().await?;
+        info!("[SETUP] V2 approvals confirmed: {:?}", res.tx_hash);
+        Ok(())
+    }
+
     // ── Relayer SDK: lazy-init RelayClient ──
 
     /// Create or return a cached RelayClient for gasless CTF operations.
@@ -711,10 +737,22 @@ impl PolymarketApi {
     ) -> Result<String> {
         let cid = parse_condition_id(condition_id)?;
         let amt = amount_to_u256(amount);
-        let tx = polymarket_relayer::split_position(PUSD, [0u8; 32], cid, &[1, 2], amt);
+        let tx = polymarket_relayer::split_pusd(cid, &[1, 2], amt);
 
         // Try relayer first (gasless)
-        match client.execute(vec![tx.clone()], "Split").await {
+        let handle_res = if self.signature_type == Some(2) || self.signature_type == Some(3) {
+            use polymarket_relayer::DepositWalletCall;
+            let calls: Vec<DepositWalletCall> = vec![tx.clone().into()];
+            let deadline = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| anyhow::anyhow!("Time error: {e}"))?
+                .as_secs() + 240;
+            client.execute_deposit_wallet_batch(calls, None, deadline, Some("Split")).await
+        } else {
+            client.execute(vec![tx.clone()], "Split").await
+        };
+
+        match handle_res {
             Ok(handle) => {
                 match handle.wait().await {
                     Ok(result) => {
@@ -742,10 +780,22 @@ impl PolymarketApi {
     ) -> Result<String> {
         let cid = parse_condition_id(condition_id)?;
         let amt = amount_to_u256(amount);
-        let tx = polymarket_relayer::merge_positions(PUSD, [0u8; 32], cid, &[1, 2], amt);
+        let tx = polymarket_relayer::merge_pusd(cid, &[1, 2], amt);
 
         // Try relayer first (gasless)
-        match client.execute(vec![tx.clone()], "Merge").await {
+        let handle_res = if self.signature_type == Some(2) || self.signature_type == Some(3) {
+            use polymarket_relayer::DepositWalletCall;
+            let calls: Vec<DepositWalletCall> = vec![tx.clone().into()];
+            let deadline = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| anyhow::anyhow!("Time error: {e}"))?
+                .as_secs() + 240;
+            client.execute_deposit_wallet_batch(calls, None, deadline, Some("Merge")).await
+        } else {
+            client.execute(vec![tx.clone()], "Merge").await
+        };
+
+        match handle_res {
             Ok(handle) => {
                 match handle.wait().await {
                     Ok(result) => {
@@ -1706,13 +1756,13 @@ mod selector_tests {
         let hash = keccak256(sig);
         println!("Sig: computeProxyAddress(address)");
         println!("Full hash: {:#x}", hash);
-        println!("Selector: {:#02x}{:#02x}{:#02x}{:#02x}", hash[0], hash[1], hash[2], hash[3]);
+        println!("Selector: {:#02x}{:#02x}{:#02x}{:#02x}", hash.0[0], hash.0[1], hash.0[2], hash.0[3]);
 
         // Also check getSalt selector
         let sig2 = b"getSalt(address)";
         let hash2 = keccak256(sig2);
         println!("\nSig: getSalt(address)");
-        println!("Selector: {:#02x}{:#02x}{:#02x}{:#02x}", hash2[0], hash2[1], hash2[2], hash2[3]);
+        println!("Selector: {:#02x}{:#02x}{:#02x}{:#02x}", hash2.0[0], hash2.0[1], hash2.0[2], hash2.0[3]);
 
         // Also compute abi.encode vs abi.encodePacked
         use alloy::sol_types::SolValue;
