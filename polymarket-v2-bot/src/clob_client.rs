@@ -234,8 +234,8 @@ mod tests {
                 relayer_api_key_address: None,
             },
             strategy: crate::config::StrategyConfig {
-                buy_price: 0.01,
-                sell_price: 0.02,
+                buy_price: 0.49,
+                sell_price: 50.0,
                 shares: 5.0,
                 simulation_mode: true,
                 market_closure_check_interval_seconds: 300,

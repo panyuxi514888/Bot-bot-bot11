@@ -33,6 +33,14 @@ pub struct Args {
     /// Side for --test-presign: "BUY" or "SELL" (default: BUY)
     #[arg(long, default_value = "BUY", requires = "test_presign")]
     pub test_side: String,
+
+    /// Test split via SDK relayer: --test-split <condition_id>
+    #[arg(long)]
+    pub test_split: Option<String>,
+
+    /// Amount in USDC for --test-split (default: 1.0)
+    #[arg(long, default_value = "1.0", requires = "test_split")]
+    pub test_split_amount: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,8 +82,8 @@ impl Default for Config {
             },
             strategy: StrategyConfig {
                 shares: 5.0,
-                buy_price: 0.01,
-                sell_price: 0.02,
+                buy_price: 0.49,
+                sell_price: 50.0,
                 check_interval_ms: 2000,
                 simulation_mode: true,
                 market_closure_check_interval_seconds: 120,

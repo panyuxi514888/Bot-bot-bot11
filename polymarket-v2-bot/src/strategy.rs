@@ -1070,7 +1070,7 @@ impl PreLimitStrategy {
 
     fn round_price(price: f64) -> f64 {
         let rounded = (price * 100.0).round() / 100.0;
-        rounded.clamp(0.01, 0.99)
+        rounded.clamp(0.01, 99.0)
     }
 
     fn cycle_trade_from_state(s: &PreLimitOrderState, shares: f64) -> CycleTrade {

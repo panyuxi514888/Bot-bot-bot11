@@ -70,8 +70,8 @@ cp config.json.example config.json
   },
   "strategy": {
     "shares": 5,
-    "buy_price": 0.01,
-    "sell_price": 0.02,
+    "buy_price": 0.49,
+    "sell_price": 50,
     "check_interval_ms": 500,
     "simulation_mode": true,
     "market_closure_check_interval_seconds": 60
@@ -84,8 +84,8 @@ cp config.json.example config.json
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | `shares` | 每边交易份额 | 5 |
-| `buy_price` | 买单价格（美元） | 0.01 |
-| `sell_price` | 卖单价格（美元） | 0.02 |
+| `buy_price` | 买单价格（美元） | 0.49 |
+| `sell_price` | 卖单价格（美元） | 50 |
 | `check_interval_ms` | 检查间隔（毫秒） | 500 |
 | `simulation_mode` | 模拟模式（不实际下单） | true |
 | `market_closure_check_interval_seconds` | 市场结算检查间隔 | 60 |

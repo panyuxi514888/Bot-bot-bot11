@@ -109,6 +109,10 @@ async fn main() -> Result<()> {
         config.polymarket.relayer_api_key_address.clone(),
     ));
 
+    if let Some(ref cid) = args.test_split {
+        return run_test_split(api.as_ref(), &config, cid, args.test_split_amount).await;
+    }
+
     if args.redeem {
         run_redeem_only(api.as_ref(), &config, args.condition_id.as_deref()).await?;
         return Ok(());
@@ -252,6 +256,82 @@ async fn run_test_presign(api: &PolymarketApi, config: &Config, args: &Args) -> 
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!("测试结果: {}", result);
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
+}
+
+async fn run_test_split(
+    api: &PolymarketApi,
+    config: &Config,
+    condition_id: &str,
+    amount: f64,
+) -> Result<()> {
+    let proxy = config
+        .polymarket
+        .proxy_wallet_address
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("--test-split 需要在 config.json 中设置 proxy_wallet_address")
+        })?;
+
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("SDK Relayer 拆单测试");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("  Proxy wallet:    {}", proxy);
+    eprintln!("  Signature type:  {:?}", config.polymarket.signature_type);
+    eprintln!("  Use relayer:     {}", config.polymarket.use_relayer);
+    eprintln!("  Amount:          ${:.2}", amount);
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let cid = if condition_id == "auto" {
+        eprintln!("正在自动发现当前 BTC 5分钟市场...");
+
+        // Authenticate first (required for market discovery)
+        if let Err(e) = api.authenticate().await {
+            anyhow::bail!("认证失败 (市场发现需要): {}", e);
+        }
+
+        let period_start = MarketDiscovery::current_5m_period_start_et();
+        let slug = MarketDiscovery::build_5m_slug("BTC", period_start);
+        eprintln!("  Slug: {}", slug);
+        let market = api.get_market_by_slug(&slug).await
+            .map_err(|e| anyhow::anyhow!("未找到当前 BTC 市场: {}", e))?;
+        eprintln!("  Condition ID: {}", market.condition_id);
+        market.condition_id
+    } else if condition_id.starts_with("0x") {
+        condition_id.to_string()
+    } else {
+        format!("0x{}", condition_id)
+    };
+
+    eprintln!("  Condition ID:    {}", cid);
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    eprintln!("\n--- 正在拆单... ---");
+    let start = std::time::Instant::now();
+
+    match api.split_shares(&cid, amount).await {
+        Ok(tx_hash) => {
+            let elapsed = start.elapsed();
+            eprintln!("\n✅ 拆单成功!");
+            eprintln!("   耗时:   {:.1?}", elapsed);
+            eprintln!("   TX:     {}", tx_hash);
+            eprintln!("   地址:   {}", proxy);
+            eprintln!("\n查看交易: https://polygonscan.com/tx/{}", tx_hash);
+        }
+        Err(e) => {
+            let elapsed = start.elapsed();
+            eprintln!("\n❌ 拆单失败 (耗时: {:.1?})", elapsed);
+            eprintln!("   错误: {}", e);
+
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("address") || err_str.contains("safe") {
+                eprintln!("\n⚠️  错误涉及地址/Safe相关逻辑，可能配置有问题");
+            }
+
+            anyhow::bail!("拆单失败: {}", e);
+        }
+    }
 
     Ok(())
 }

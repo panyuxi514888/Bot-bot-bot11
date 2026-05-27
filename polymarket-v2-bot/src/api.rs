@@ -44,6 +44,48 @@ use polymarket_relayer::{
     AuthMethod, RelayClient, RelayerTxType,
 };
 
+// ── DepositWallet / Factory Constants ──
+
+/// DepositWalletFactory address on Polygon.
+const DEPOSIT_WALLET_FACTORY: &str = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07";
+
+/// pUSD (Polymarket USD) on Polygon.
+const PUSD: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+
+/// EIP-712 typehash for Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)
+/// EIP-712 typehash for Batch with Call dependency appended per EIP-712 encodeType:
+/// keccak256("Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)Call(address target,uint256 value,bytes data)")
+const BATCH_TYPEHASH: [u8; 32] = [
+    0x71, 0x2e, 0xf6, 0x6e, 0x83, 0x62, 0xc3, 0x87,
+    0xe8, 0x62, 0xca, 0xbf, 0x09, 0x23, 0xc2, 0x09,
+    0xdb, 0x0f, 0xa2, 0x4c, 0xfc, 0x97, 0xd2, 0x5e,
+    0xcc, 0xba, 0x7c, 0x86, 0xf3, 0xee, 0x1d, 0xd3,
+];
+
+/// EIP-712 typehash for Call(address target,uint256 value,bytes data)
+const CALL_TYPEHASH: [u8; 32] = [
+    0x84, 0xfa, 0x2c, 0xf0, 0x5c, 0xd8, 0x8e, 0x99,
+    0x2e, 0xae, 0x77, 0xe8, 0x51, 0xaf, 0x68, 0xa4,
+    0xee, 0x27, 0x8d, 0xcf, 0xf6, 0xef, 0x50, 0x4e,
+    0x48, 0x7a, 0x55, 0xb3, 0xba, 0xad, 0xfb, 0xe5,
+];
+
+/// Compute the EIP-712 domain separator for a DepositWallet
+/// (name="DepositWallet", version="1", chainId=137, verifyingContract=<wallet>).
+fn deposit_wallet_domain(wallet: ethers::types::Address) -> [u8; 32] {
+    let domain_type = b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+    let domain_typehash = ethers::utils::keccak256(domain_type);
+    let name_hash = ethers::utils::keccak256(b"DepositWallet");
+    let version_hash = ethers::utils::keccak256(b"1");
+    ethers::utils::keccak256(&ethers::abi::encode(&[
+        ethers::abi::Token::FixedBytes(domain_typehash.to_vec()),
+        ethers::abi::Token::FixedBytes(name_hash.to_vec()),
+        ethers::abi::Token::FixedBytes(version_hash.to_vec()),
+        ethers::abi::Token::Uint(ethers::types::U256::from(137u64)),
+        ethers::abi::Token::Address(wallet),
+    ]))
+}
+
 // Type alias for authenticated v2 CLOB client
 type AuthClobClient = polymarket_client_sdk_v2::clob::Client<
     polymarket_client_sdk_v2::auth::state::Authenticated<
@@ -450,7 +492,217 @@ impl PolymarketApi {
         Ok(client)
     }
 
+    /// Execute a contract call through DepositWalletFactory.proxy().
+    ///
+    /// Builds an EIP-712 signed Batch, calls factory.proxy() directly from the EOA.
+    /// The EOA pays gas.
+    async fn factory_proxy_execute(
+        &self,
+        target: ethers::types::Address,
+        call_data: &[u8],
+        description: &str,
+    ) -> Result<String> {
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key required"))?;
+        let wallet_str = self.safe_addr_address.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Proxy wallet address required"))?;
+        let rpc_url = self.get_rpc_url();
+
+        let wallet: ethers::types::Address = wallet_str.parse()?;
+        let factory: ethers::types::Address = ethers::types::Address::from_str(DEPOSIT_WALLET_FACTORY)?;
+        let eoa: ethers::signers::LocalWallet = private_key.parse()
+            .context("Failed to parse private key")?;
+
+        // ── 1. Query wallet nonce from on-chain ──
+        let nonce = self.query_deposit_wallet_nonce(&rpc_url, wallet).await?;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("Time error: {e}"))?
+            .as_secs() + 3600;
+
+        // ── 2. Compute EIP-712 typed data hash ──
+        // call_hash = keccak256(abi.encode(CALL_TYPEHASH, target, value, keccak256(data)))
+        let call_data_hash = ethers::utils::keccak256(call_data);
+        let call_hash = ethers::utils::keccak256(&ethers::abi::encode(&[
+            ethers::abi::Token::FixedBytes(CALL_TYPEHASH.to_vec()),
+            ethers::abi::Token::Address(target),
+            ethers::abi::Token::Uint(ethers::types::U256::zero()),
+            ethers::abi::Token::FixedBytes(call_data_hash.to_vec()),
+        ]));
+
+        // struct_hash = keccak256(abi.encode(BATCH_TYPEHASH, wallet, nonce, deadline,
+        //     keccak256(abi.encode(call_hash)))
+        let calls_root = ethers::utils::keccak256(&call_hash);
+        let struct_hash = ethers::utils::keccak256(&ethers::abi::encode(&[
+            ethers::abi::Token::FixedBytes(BATCH_TYPEHASH.to_vec()),
+            ethers::abi::Token::Address(wallet),
+            ethers::abi::Token::Uint(ethers::types::U256::from(nonce)),
+            ethers::abi::Token::Uint(ethers::types::U256::from(deadline)),
+            ethers::abi::Token::FixedBytes(calls_root.to_vec()),
+        ]));
+
+        // Data = "\x19\x01" || domain_separator || struct_hash
+        let domain_sep = deposit_wallet_domain(wallet);
+        let mut typed_data_input = Vec::with_capacity(2 + 32 + 32);
+        typed_data_input.extend_from_slice(&[0x19, 0x01]);
+        typed_data_input.extend_from_slice(&domain_sep);
+        typed_data_input.extend_from_slice(&struct_hash);
+        let typed_data_hash = ethers::utils::keccak256(&typed_data_input);
+
+        // ── 3. Sign with EOA ──
+        let sig = eoa.sign_hash(ethers::types::H256::from_slice(&typed_data_hash))
+            .context("Failed to sign typed data hash")?;
+
+        // Convert to 65-byte format: r (32) || s (32) || v (27/28)
+        let mut sig_65 = Vec::with_capacity(65);
+        let mut r_bytes = [0u8; 32];
+        sig.r.to_big_endian(&mut r_bytes);
+        let mut s_bytes = [0u8; 32];
+        sig.s.to_big_endian(&mut s_bytes);
+        sig_65.extend_from_slice(&r_bytes);
+        sig_65.extend_from_slice(&s_bytes);
+        let v_byte = if sig.v >= 27 { sig.v as u8 } else { 27 + sig.v as u8 };
+        sig_65.push(v_byte);
+
+        // ── 4. ABI-encode factory.proxy() call ──
+        // proxy((address,uint256,uint256,(address,uint256,bytes)[])[],bytes[])
+        let proxy_selector = [0x26, 0x9d, 0x7c, 0x39];
+        let encoded = ethers::abi::encode(&[
+            ethers::abi::Token::Array(vec![
+                ethers::abi::Token::Tuple(vec![
+                    ethers::abi::Token::Address(wallet),
+                    ethers::abi::Token::Uint(ethers::types::U256::from(nonce)),
+                    ethers::abi::Token::Uint(ethers::types::U256::from(deadline)),
+                    ethers::abi::Token::Array(vec![
+                        ethers::abi::Token::Tuple(vec![
+                            ethers::abi::Token::Address(target),
+                            ethers::abi::Token::Uint(ethers::types::U256::zero()),
+                            ethers::abi::Token::Bytes(call_data.to_vec()),
+                        ]),
+                    ]),
+                ]),
+            ]),
+            ethers::abi::Token::Array(vec![
+                ethers::abi::Token::Bytes(sig_65),
+            ]),
+        ]);
+        let mut calldata = Vec::with_capacity(4 + encoded.len());
+        calldata.extend_from_slice(&proxy_selector);
+        calldata.extend_from_slice(&encoded);
+
+        // ── 5. Get EOA nonce & gas estimate, send raw transaction ──
+        let tx_hash = self.send_raw_tx(&rpc_url, factory, &calldata).await?;
+        info!("{} executed via factory.proxy(): {}", description, tx_hash);
+        Ok(tx_hash)
+    }
+
+    /// Query the on-chain nonce of a DepositWallet.
+    async fn query_deposit_wallet_nonce(&self, rpc_url: &str, wallet: ethers::types::Address) -> Result<u64> {
+        // nonce() -> 0xaffed0e0
+        let selector = [0xaf, 0xfe, 0xd0, 0xe0];
+        let data = format!("0x{}", hex::encode(selector));
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{
+                "to": format!("{:?}", wallet),
+                "data": data,
+            }, "latest"],
+            "id": 1,
+        });
+
+        let resp: serde_json::Value = self.client.post(rpc_url).json(&body).send().await?
+            .json().await?;
+
+        let hex_str = resp["result"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("No result in nonce response: {:?}", resp))?;
+        let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+        u64::from_str_radix(hex_str, 16)
+            .context("Failed to parse wallet nonce")
+    }
+
+    /// Build, sign, and send a raw transaction from the EOA.
+    async fn send_raw_tx(&self, rpc_url: &str, to: ethers::types::Address, data: &[u8]) -> Result<String> {
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key required"))?;
+        let eoa: ethers::signers::LocalWallet = private_key.parse()
+            .context("Failed to parse private key")?;
+
+        // Get EOA nonce
+        use ethers::signers::Signer;
+        let eoa_addr = eoa.address();
+        let nonce_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionCount",
+            "params": [format!("{:?}", eoa_addr), "latest"],
+            "id": 1,
+        });
+        let resp: serde_json::Value = self.client.post(rpc_url).json(&nonce_body).send().await?
+            .json().await?;
+        let nonce_hex = resp["result"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("No nonce result: {:?}", resp))?;
+        let nonce_hex = nonce_hex.strip_prefix("0x").unwrap_or(nonce_hex);
+        let eoa_nonce: u64 = u64::from_str_radix(nonce_hex, 16)
+            .context("Failed to parse nonce")?;
+
+        // Get gas price
+        let gp_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_gasPrice",
+            "params": [],
+            "id": 1,
+        });
+        let gp_resp: serde_json::Value = self.client.post(rpc_url).json(&gp_body).send().await?
+            .json().await?;
+        let gp_hex = gp_resp["result"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("No gas price result: {:?}", gp_resp))?;
+        let gas_price: ethers::types::U256 = ethers::types::U256::from_str_radix(
+            gp_hex.strip_prefix("0x").unwrap_or(gp_hex), 16,
+        )?;
+
+        // Build & sign legacy tx
+        let tx = ethers::types::TransactionRequest {
+            to: Some(ethers::types::NameOrAddress::Address(to)),
+            data: Some(data.to_vec().into()),
+            value: Some(0u64.into()),
+            gas: Some(ethers::types::U256::from(600_000u64)),
+            gas_price: Some(gas_price),
+            nonce: Some(ethers::types::U256::from(eoa_nonce)),
+            chain_id: Some(ethers::types::U64::from(137)),
+            ..Default::default()
+        };
+
+        // EIP-155: hash(rlp with chain_id,0,0) → sign → adjust v → rlp_signed
+        let rlp_encoded = tx.rlp();
+        let tx_hash = ethers::utils::keccak256(&rlp_encoded);
+        let mut sig = eoa.sign_hash(ethers::types::H256::from_slice(&tx_hash))
+            .context("Failed to sign transaction")?;
+        sig.v = 137u64 * 2 + 35 + (sig.v - 27);
+        let raw_tx = tx.rlp_signed(&sig);
+
+        let send_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_sendRawTransaction",
+            "params": [format!("0x{}", hex::encode(raw_tx))],
+            "id": 1,
+        });
+        let send_resp: serde_json::Value = self.client.post(rpc_url).json(&send_body).send().await?
+            .json().await?;
+
+        if let Some(tx_hash) = send_resp["result"].as_str() {
+            Ok(tx_hash.to_string())
+        } else if let Some(err) = send_resp["error"].as_object() {
+            anyhow::bail!("eth_sendRawTransaction failed: {} (data: {:?})",
+                err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown"),
+                err.get("data"));
+        } else {
+            anyhow::bail!("Unexpected eth_sendRawTransaction response: {:?}", send_resp)
+        }
+    }
+
     /// Split USDC into conditional tokens via relayer (gasless).
+    /// Falls back to CTF direct (EOA pays gas) if the relayer rejects.
     async fn split_via_sdk_relayer(
         &self,
         client: &RelayClient,
@@ -459,15 +711,29 @@ impl PolymarketApi {
     ) -> Result<String> {
         let cid = parse_condition_id(condition_id)?;
         let amt = amount_to_u256(amount);
-        let tx = polymarket_relayer::operations::split_regular(cid, &[1, 2], amt);
-        let handle = client.execute(vec![tx], "Split").await
-            .context("Relayer split execute failed")?;
-        let result = handle.wait().await
-            .context("Relayer split wait failed")?;
-        Ok(format!("{:?}", result.tx_hash))
+        let tx = polymarket_relayer::split_position(PUSD, [0u8; 32], cid, &[1, 2], amt);
+
+        // Try relayer first (gasless)
+        match client.execute(vec![tx.clone()], "Split").await {
+            Ok(handle) => {
+                match handle.wait().await {
+                    Ok(result) => {
+                        info!("SDK relayer split confirmed: {:?}", result.tx_hash);
+                        return Ok(format!("{:?}", result.tx_hash));
+                    }
+                    Err(e) => warn!("Relayer wait failed, falling back to direct execution: {:?}", e),
+                }
+            }
+            Err(e) => warn!("Relayer execute failed, falling back to direct execution: {:?}", e),
+        }
+
+        // Fallback: execute via CTF direct (EOA pays gas)
+        info!("Falling back to CTF direct for split...");
+        self.split_via_ctf_direct(condition_id, amount).await
     }
 
     /// Merge conditional tokens back to USDC via relayer (gasless).
+    /// Falls back to factory.proxy() if the relayer rejects.
     async fn merge_via_sdk_relayer(
         &self,
         client: &RelayClient,
@@ -476,15 +742,29 @@ impl PolymarketApi {
     ) -> Result<String> {
         let cid = parse_condition_id(condition_id)?;
         let amt = amount_to_u256(amount);
-        let tx = polymarket_relayer::operations::merge_regular(cid, &[1, 2], amt);
-        let handle = client.execute(vec![tx], "Merge").await
-            .context("Relayer merge execute failed")?;
-        let result = handle.wait().await
-            .context("Relayer merge wait failed")?;
-        Ok(format!("{:?}", result.tx_hash))
+        let tx = polymarket_relayer::merge_positions(PUSD, [0u8; 32], cid, &[1, 2], amt);
+
+        // Try relayer first (gasless)
+        match client.execute(vec![tx.clone()], "Merge").await {
+            Ok(handle) => {
+                match handle.wait().await {
+                    Ok(result) => {
+                        info!("SDK relayer merge confirmed: {:?}", result.tx_hash);
+                        return Ok(format!("{:?}", result.tx_hash));
+                    }
+                    Err(e) => warn!("Relayer merge wait failed, falling back: {:?}", e),
+                }
+            }
+            Err(e) => warn!("Relayer merge execute failed, falling back: {:?}", e),
+        }
+
+        // Fallback: execute via CTF direct (EOA pays gas)
+        info!("Falling back to CTF direct for merge...");
+        self.merge_via_ctf_direct(condition_id, amount).await
     }
 
     /// Redeem winning tokens via relayer (gasless).
+    /// Falls back to factory.proxy() if the relayer rejects.
     async fn redeem_via_sdk_relayer(
         &self,
         client: &RelayClient,
@@ -492,11 +772,120 @@ impl PolymarketApi {
     ) -> Result<String> {
         let cid = parse_condition_id(condition_id)?;
         let tx = polymarket_relayer::operations::redeem_regular(cid, &[1, 2]);
-        let handle = client.execute(vec![tx], "Redeem").await
-            .context("Relayer redeem execute failed")?;
-        let result = handle.wait().await
-            .context("Relayer redeem wait failed")?;
-        Ok(format!("{:?}", result.tx_hash))
+
+        // Try relayer first (gasless)
+        match client.execute(vec![tx.clone()], "Redeem").await {
+            Ok(handle) => {
+                match handle.wait().await {
+                    Ok(result) => {
+                        info!("SDK relayer redeem confirmed: {:?}", result.tx_hash);
+                        return Ok(format!("{:?}", result.tx_hash));
+                    }
+                    Err(e) => warn!("Relayer redeem wait failed, falling back: {:?}", e),
+                }
+            }
+            Err(e) => warn!("Relayer redeem execute failed, falling back: {:?}", e),
+        }
+
+        // Fallback: execute via CTF direct (EOA pays gas)
+        self.redeem_via_ctf_direct(condition_id).await
+    }
+
+    // ── CTF Direct Fallbacks ──
+
+    /// Create an Alloy provider + CTF client using the EOA signer.
+    async fn create_ctf_client(&self) -> Result<CtfClient<impl alloy::providers::Provider + Clone>> {
+        let signer = self.create_signer()?;
+        let rpc_url = self.get_rpc_url();
+        let provider = alloy::providers::ProviderBuilder::new()
+            .wallet(signer)
+            .connect(&rpc_url)
+            .await
+            .context("Failed to create CTF provider")?;
+        CtfClient::new(provider, POLYGON)
+            .map_err(|e| anyhow::anyhow!("Failed to create CTF client: {e}"))
+    }
+
+    /// Fallback: split via CTF direct (EOA pays gas, bypasses DepositWallet).
+    async fn split_via_ctf_direct(&self, condition_id: &str, amount: f64) -> Result<String> {
+        let ct = self.create_ctf_client().await?;
+        let cid = parse_condition_id(condition_id)?;
+        let config = polymarket_client_sdk_v2::contract_config(POLYGON, false)
+            .ok_or_else(|| anyhow::anyhow!("No contract config for POLYGON"))?;
+        let amount_u256 = alloy::primitives::U256::from((amount * 1_000_000.0) as u64);
+
+        let cid_b256: B256 = B256::from(cid);
+        let req = SplitPositionRequest::for_binary_market(
+            config.collateral,
+            cid_b256,
+            amount_u256,
+        );
+
+        let result = ct.split_position(&req).await
+            .context("CTF direct split failed")?;
+        let tx_hash = format!("{:?}", result.transaction_hash);
+        info!("CTF direct split: {}", tx_hash);
+        Ok(tx_hash)
+    }
+
+    /// Fallback: merge via CTF direct (EOA pays gas, bypasses DepositWallet).
+    async fn merge_via_ctf_direct(&self, condition_id: &str, amount: f64) -> Result<String> {
+        let ct = self.create_ctf_client().await?;
+        let cid = parse_condition_id(condition_id)?;
+        let config = polymarket_client_sdk_v2::contract_config(POLYGON, false)
+            .ok_or_else(|| anyhow::anyhow!("No contract config for POLYGON"))?;
+        let amount_u256 = alloy::primitives::U256::from((amount * 1_000_000.0) as u64);
+
+        let cid_b256: B256 = B256::from(cid);
+        let req = MergePositionsRequest::builder()
+            .collateral_token(config.collateral)
+            .condition_id(cid_b256)
+            .partition(vec![alloy::primitives::U256::from(1)])
+            .amount(amount_u256)
+            .build();
+
+        let result = match ct.merge_positions(&req).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Merge with partition [1] failed: {}. Trying [2]...", e);
+                let req2 = MergePositionsRequest::builder()
+                    .collateral_token(config.collateral)
+                    .condition_id(cid_b256)
+                    .partition(vec![alloy::primitives::U256::from(2)])
+                    .amount(amount_u256)
+                    .build();
+                ct.merge_positions(&req2).await
+                    .map_err(|e2| anyhow::anyhow!("CTF direct merge failed: {} / {}", e, e2))?
+            }
+        };
+
+        let tx_hash = format!("{:?}", result.transaction_hash);
+        info!("CTF direct merge: {}", tx_hash);
+        Ok(tx_hash)
+    }
+
+    /// Fallback: redeem via CTF direct (EOA pays gas, bypasses DepositWallet).
+    async fn redeem_via_ctf_direct(&self, condition_id: &str) -> Result<String> {
+        let ct = self.create_ctf_client().await?;
+        let cid = parse_condition_id(condition_id)?;
+        let config = polymarket_client_sdk_v2::contract_config(POLYGON, false)
+            .ok_or_else(|| anyhow::anyhow!("No contract config for POLYGON"))?;
+
+        let cid_b256: B256 = B256::from(cid);
+        let req = RedeemPositionsRequest::builder()
+            .collateral_token(config.collateral)
+            .condition_id(cid_b256)
+            .index_sets(vec![
+                alloy::primitives::U256::from(1),
+                alloy::primitives::U256::from(2),
+            ])
+            .build();
+
+        let result = ct.redeem_positions(&req).await
+            .context("CTF direct redeem failed")?;
+        let tx_hash = format!("{:?}", result.transaction_hash);
+        info!("CTF direct redeem: {}", tx_hash);
+        Ok(tx_hash)
     }
 
     // ── P1: Pre-signed order support ──
