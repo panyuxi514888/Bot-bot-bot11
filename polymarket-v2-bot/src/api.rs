@@ -1590,7 +1590,7 @@ mod tests {
     // EOA derived: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
     const TEST_PRIVATE_KEY: &str =
         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-    const TEST_FUNDER: &str = "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48";
+    const TEST_FUNDER: &str = "0x1111111111111111111111111111111111111111";
 
     #[tokio::test]
     async fn test_create_funder_l1_headers_contains_all_keys() {
@@ -1618,7 +1618,7 @@ mod tests {
         let poly_address = headers.get("POLY_ADDRESS").unwrap().to_str().unwrap();
         assert_eq!(
             poly_address,
-            "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48"
+            "0x1111111111111111111111111111111111111111"
         );
         assert_ne!(poly_address, &eoa.encode_hex_with_prefix());
     }
@@ -1718,7 +1718,7 @@ mod selector_tests {
         use alloy::sol_types::SolValue;
         use alloy::hex::ToHexExt;
 
-        let eoa: alloy::primitives::Address = "0x2200709f4eeee905a9f463afc92e215630bc6b62".parse().unwrap();
+        let eoa: alloy::primitives::Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
 
         // abi.encode = left-padded 32 bytes
         let encoded = (eoa,).abi_encode_params();

@@ -249,9 +249,9 @@ mod tests {
     fn test_resolve_ws_address_prefers_proxy_wallet() {
         let mut config = minimal_config();
         config.polymarket.proxy_wallet_address =
-            Some("0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48".to_string());
+            Some("0x1111111111111111111111111111111111111111".to_string());
         let addr = ClobClient::resolve_ws_address(&config).unwrap();
-        assert_eq!(addr, "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48");
+        assert_eq!(addr, "0x1111111111111111111111111111111111111111");
     }
 
     #[test]

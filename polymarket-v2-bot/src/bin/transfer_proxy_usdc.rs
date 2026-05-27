@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 const CHAIN_ID: u64 = 137;
 const PROXY_WALLET: &str = "0x88cc81f9b42132d47a176b05fd85eaa758945549";
-const DEST_WALLET: &str = "0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48";
+const DEST_WALLET: &str = "0x1111111111111111111111111111111111111111";
 const USDC: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 // 1 USDC = 1_000_000 (6 decimals)
 const AMOUNT: u64 = 1_000_000;

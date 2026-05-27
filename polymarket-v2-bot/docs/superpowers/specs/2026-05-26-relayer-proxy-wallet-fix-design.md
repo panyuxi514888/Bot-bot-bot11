@@ -5,7 +5,7 @@
 
 ## Problem
 
-The bot's custom relayer implementation (`execute_relayer_tx` in `api.rs`) hardcodes Safe wallet address derivation via CREATE2. The user's wallet is a Magic.link Proxy wallet (address `0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48`), not a Safe wallet. This causes:
+The bot's custom relayer implementation (`execute_relayer_tx` in `api.rs`) hardcodes Safe wallet address derivation via CREATE2. The user's wallet is a Magic.link Proxy wallet (address `0x1111111111111111111111111111111111111111`), not a Safe wallet. This causes:
 
 1. **Address mismatch**: The derived Safe address never matches the actual proxy wallet address, so CTF operations (split/merge) send tokens to the wrong address.
 2. **Wrong signature format**: SafeTx EIP-712 signatures are used instead of the format expected for proxy wallets.
@@ -16,10 +16,10 @@ The CLOB API path (order placement) already correctly uses the proxy wallet addr
 
 | Key | Value |
 |-----|-------|
-| EOA | `0x2200709f4eeee905a9f463afc92e215630bc6b62` |
-| Proxy wallet | `0x30f6fbe55c1a45bd9fa7cc9823649bf6cc3a2e48` |
+| EOA | `0x2222222222222222222222222222222222222222` |
+| Proxy wallet | `0x1111111111111111111111111111111111111111` |
 | Signature type | 3 (Poly1271) |
-| Relayer API key address | `0x2200709f4eeee905a9f463afc92e215630bc6b62` |
+| Relayer API key address | `0x2222222222222222222222222222222222222222` |
 
 ## Solution
 
